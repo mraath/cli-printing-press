@@ -12,3 +12,5 @@ catalog/specs/*.graphql
 library/
 dist/
 claude-upgrade-progress.json
+
+.claude/
