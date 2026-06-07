@@ -13,10 +13,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/spf13/cobra"
 	"printing-press-golden-pp-cli/internal/client"
 	"printing-press-golden-pp-cli/internal/config"
 	"printing-press-golden-pp-cli/internal/store"
-	"github.com/spf13/cobra"
 )
 
 // looksLikeDoctorInterstitial reports whether the response body matches a known
@@ -227,6 +227,8 @@ func newDoctorCmd(flags *rootFlags) *cobra.Command {
 				case strings.HasPrefix(s, "optional"):
 					// Optional-auth CLI with no key set — informational, not a failure.
 					indicator = yellow("INFO")
+				case strings.Contains(s, "scope-limited"):
+					indicator = yellow("WARN")
 				case strings.Contains(s, "error") || strings.Contains(s, "not configured") || strings.Contains(s, "unreachable") || strings.Contains(s, "invalid") || strings.Contains(s, "missing"):
 					indicator = red("FAIL")
 				case s == "not required":

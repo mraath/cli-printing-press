@@ -18,6 +18,7 @@ category: developer-tools
 spec_url: https://example.com/openapi.yaml
 spec_format: yaml
 openapi_version: "3.0"
+base_url: https://api.example.com
 tier: community
 verified_date: "2026-03-23"
 homepage: https://example.com
@@ -40,6 +41,7 @@ notes: Example fixture.
 	assert.Equal(t, "https://example.com/openapi.yaml", entry.SpecURL)
 	assert.Equal(t, "yaml", entry.SpecFormat)
 	assert.Equal(t, "3.0", entry.OpenAPIVersion)
+	assert.Equal(t, "https://api.example.com", entry.BaseURL)
 	assert.Equal(t, "community", entry.Tier)
 	assert.Equal(t, "2026-03-23", entry.VerifiedDate)
 	assert.Equal(t, "https://example.com", entry.Homepage)
@@ -145,6 +147,13 @@ func TestValidateEntry(t *testing.T) {
 			wantErr: "http_transport must be one of",
 		},
 		{
+			name: "non https base url",
+			mutate: func(e *Entry) {
+				e.BaseURL = "http://api.example.com"
+			},
+			wantErr: `base_url must start with "https://"`,
+		},
+		{
 			name: "bearer refresh missing bundle URL",
 			mutate: func(e *Entry) {
 				e.BearerRefresh.Pattern = `AAAA[^"]+`
@@ -173,6 +182,48 @@ func TestValidateEntry(t *testing.T) {
 				e.AuthKeyURL = "http://example.com/keys"
 			},
 			wantErr: `auth_key_url must start with "https://"`,
+		},
+		{
+			name: "auth_env_vars empty entry",
+			mutate: func(e *Entry) {
+				e.AuthEnvVars = []string{"STRIPE_SECRET_KEY", " "}
+			},
+			wantErr: "auth_env_vars[1] must not be empty",
+		},
+		{
+			name: "auth_env_vars leading whitespace rejected",
+			mutate: func(e *Entry) {
+				e.AuthEnvVars = []string{"  STRIPE_KEY"}
+			},
+			wantErr: "must not have leading or trailing whitespace",
+		},
+		{
+			name: "auth_env_vars trailing whitespace rejected",
+			mutate: func(e *Entry) {
+				e.AuthEnvVars = []string{"STRIPE_KEY  "}
+			},
+			wantErr: "must not have leading or trailing whitespace",
+		},
+		{
+			name: "auth_env_vars lowercase rejected",
+			mutate: func(e *Entry) {
+				e.AuthEnvVars = []string{"stripe_secret_key"}
+			},
+			wantErr: "must be uppercase letters",
+		},
+		{
+			name: "auth_env_vars duplicate rejected",
+			mutate: func(e *Entry) {
+				e.AuthEnvVars = []string{"STRIPE_SECRET_KEY", "STRIPE_SECRET_KEY"}
+			},
+			wantErr: `auth_env_vars[1] "STRIPE_SECRET_KEY" is a duplicate`,
+		},
+		{
+			name: "auth_env_vars leading digit rejected",
+			mutate: func(e *Entry) {
+				e.AuthEnvVars = []string{"1STRIPE_KEY"}
+			},
+			wantErr: "must be uppercase letters",
 		},
 	}
 
@@ -313,6 +364,38 @@ func TestOptionalFieldsOmittedValid(t *testing.T) {
 	assert.Empty(t, entry.BearerRefresh.BundleURL)
 }
 
+func TestAuthEnvVarsValid(t *testing.T) {
+	entry := Entry{
+		Name:        "stripe",
+		DisplayName: "Stripe",
+		Description: "Payments API",
+		Category:    "payments",
+		SpecURL:     "https://example.com/openapi.yaml",
+		SpecFormat:  "yaml",
+		Tier:        "official",
+		AuthEnvVars: []string{"STRIPE_SECRET_KEY", "STRIPE_API_KEY"},
+	}
+	require.NoError(t, entry.Validate())
+}
+
+func TestAuthEnvVarsParse(t *testing.T) {
+	data := []byte(`
+name: stripe
+display_name: Stripe
+description: Payments
+category: payments
+spec_url: https://example.com/openapi.yaml
+spec_format: yaml
+tier: official
+auth_env_vars:
+  - STRIPE_SECRET_KEY
+  - STRIPE_API_KEY
+`)
+	entry, err := ParseEntry(data)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"STRIPE_SECRET_KEY", "STRIPE_API_KEY"}, entry.AuthEnvVars)
+}
+
 func TestBearerRefreshValid(t *testing.T) {
 	entry := Entry{
 		Name:        "browser-api",
@@ -417,9 +500,11 @@ func TestEmbeddedCatalogParsesWrapperOnlyEntries(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, entry.IsWrapperOnly())
 	assert.Equal(t, "travel", entry.Category)
-	require.Len(t, entry.WrapperLibraries, 1)
+	require.Len(t, entry.WrapperLibraries, 2)
 	assert.Equal(t, "krisukox/google-flights-api", entry.WrapperLibraries[0].Name)
 	assert.Equal(t, "native", entry.WrapperLibraries[0].IntegrationMode)
+	assert.Equal(t, "punitarani/fli", entry.WrapperLibraries[1].Name)
+	assert.Equal(t, "subprocess", entry.WrapperLibraries[1].IntegrationMode)
 }
 
 func TestPublicCategoriesExcludeExample(t *testing.T) {

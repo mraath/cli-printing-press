@@ -13,16 +13,17 @@ import (
 )
 
 func newProjectsTasksUpdateProjectCmd(flags *rootFlags) *cobra.Command {
+	var flagNotify bool
 	var bodyCompleted bool
 	var bodyPriority string
 	var bodyTitle string
 	var stdinBody bool
 
 	cmd := &cobra.Command{
-		Use:   "update-project <projectId> <taskId>",
-		Aliases: []string{"update"},
-		Short: "Update project task",
-		Example: "  printing-press-golden-pp-cli projects tasks update-project 550e8400-e29b-41d4-a716-446655440000 550e8400-e29b-41d4-a716-446655440000",
+		Use:         "update-project <projectId> <taskId>",
+		Aliases:     []string{"update"},
+		Short:       "Update project task",
+		Example:     "  printing-press-golden-pp-cli projects tasks update-project 550e8400-e29b-41d4-a716-446655440000 550e8400-e29b-41d4-a716-446655440000",
 		Annotations: map[string]string{"pp:endpoint": "tasks.update-project", "pp:method": "PATCH", "pp:path": "/projects/{projectId}/tasks/{taskId}"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 0 {
@@ -41,6 +42,10 @@ func newProjectsTasksUpdateProjectCmd(flags *rootFlags) *cobra.Command {
 				return usageErr(fmt.Errorf("taskId is required\nUsage: %s <%s>", cmd.CommandPath(), "taskId"))
 			}
 			path = replacePathParam(path, "taskId", args[1])
+			params := map[string]string{}
+			if flagNotify != false {
+				params["notify"] = fmt.Sprintf("%v", flagNotify)
+			}
 			var body map[string]any
 			if stdinBody {
 				stdinData, err := io.ReadAll(os.Stdin)
@@ -54,7 +59,7 @@ func newProjectsTasksUpdateProjectCmd(flags *rootFlags) *cobra.Command {
 				body = jsonBody
 			} else {
 				body = map[string]any{}
-				if bodyCompleted != false {
+				if cmd.Flags().Changed("completed") {
 					body["completed"] = bodyCompleted
 				}
 				if bodyPriority != "" {
@@ -64,7 +69,7 @@ func newProjectsTasksUpdateProjectCmd(flags *rootFlags) *cobra.Command {
 					body["title"] = bodyTitle
 				}
 			}
-			data, statusCode, err := c.Patch(path, body)
+			data, statusCode, err := c.PatchWithParams(path, params, body)
 			if err != nil {
 				return classifyAPIError(err, flags)
 			}
@@ -78,7 +83,9 @@ func newProjectsTasksUpdateProjectCmd(flags *rootFlags) *cobra.Command {
 						return nil
 					}
 				} else {
-					var wrapped struct{ Data []map[string]any `json:"data"` }
+					var wrapped struct {
+						Data []map[string]any `json:"data"`
+					}
 					if json.Unmarshal(data, &wrapped) == nil && len(wrapped.Data) > 0 {
 						if err := printAutoTable(cmd.OutOrStdout(), wrapped.Data); err != nil {
 							fmt.Fprintf(os.Stderr, "warning: table rendering failed, falling back to JSON: %v\n", err)
@@ -129,6 +136,7 @@ func newProjectsTasksUpdateProjectCmd(flags *rootFlags) *cobra.Command {
 			return printOutputWithFlags(cmd.OutOrStdout(), data, flags)
 		},
 	}
+	cmd.Flags().BoolVar(&flagNotify, "notify", false, "Notify")
 	cmd.Flags().BoolVar(&bodyCompleted, "completed", false, "Completed")
 	cmd.Flags().StringVar(&bodyPriority, "priority", "", "Priority")
 	cmd.Flags().StringVar(&bodyTitle, "title", "", "Title")

@@ -5,6 +5,7 @@ package mcp
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -15,8 +16,8 @@ import (
 	mcplib "github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 	"mcp-cloudflare-pp-cli/internal/cli"
-	"mcp-cloudflare-pp-cli/internal/cliutil"
 	"mcp-cloudflare-pp-cli/internal/client"
+	"mcp-cloudflare-pp-cli/internal/cliutil"
 	"mcp-cloudflare-pp-cli/internal/config"
 	"mcp-cloudflare-pp-cli/internal/mcp/cobratree"
 	"mcp-cloudflare-pp-cli/internal/store"
@@ -61,7 +62,7 @@ type mcpParamBinding struct {
 }
 
 // makeAPIHandler creates a generic MCP tool handler for an API endpoint.
-func makeAPIHandler(method, pathTemplate string, bindings []mcpParamBinding, positionalParams []string) server.ToolHandlerFunc {
+func makeAPIHandler(method, pathTemplate string, binaryResponse bool, bindings []mcpParamBinding, positionalParams []string) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcplib.CallToolRequest) (*mcplib.CallToolResult, error) {
 		c, err := newMCPClient()
 		if err != nil {
@@ -81,6 +82,10 @@ func makeAPIHandler(method, pathTemplate string, bindings []mcpParamBinding, pos
 		pathParams := make(map[string]bool, len(positionalParams))
 		params := make(map[string]string)
 		bodyArgs := make(map[string]any)
+		var headers map[string]string
+		if binaryResponse {
+			headers = map[string]string{client.BinaryResponseHeader: "true"}
+		}
 		for _, binding := range bindings {
 			knownArgs[binding.PublicName] = true
 			v, ok := args[binding.PublicName]
@@ -124,18 +129,35 @@ func makeAPIHandler(method, pathTemplate string, bindings []mcpParamBinding, pos
 		var data json.RawMessage
 		switch method {
 		case "GET":
+			if binaryResponse {
+				data, err = c.GetWithHeaders(path, params, headers)
+				break
+			}
 			data, err = c.Get(path, params)
 		case "POST":
-			body, _ := json.Marshal(bodyArgs)
-			data, _, err = c.Post(path, body)
+			if binaryResponse {
+				data, _, err = c.PostWithParamsAndHeaders(path, params, bodyArgs, headers)
+				break
+			}
+			data, _, err = c.PostWithParams(path, params, bodyArgs)
 		case "PUT":
-			body, _ := json.Marshal(bodyArgs)
-			data, _, err = c.Put(path, body)
+			if binaryResponse {
+				data, _, err = c.PutWithParamsAndHeaders(path, params, bodyArgs, headers)
+				break
+			}
+			data, _, err = c.PutWithParams(path, params, bodyArgs)
 		case "PATCH":
-			body, _ := json.Marshal(bodyArgs)
-			data, _, err = c.Patch(path, body)
+			if binaryResponse {
+				data, _, err = c.PatchWithParamsAndHeaders(path, params, bodyArgs, headers)
+				break
+			}
+			data, _, err = c.PatchWithParams(path, params, bodyArgs)
 		case "DELETE":
-			data, _, err = c.Delete(path)
+			if binaryResponse {
+				data, _, err = c.DeleteWithParamsAndHeaders(path, params, headers)
+				break
+			}
+			data, _, err = c.DeleteWithParams(path, params)
 		default:
 			return mcplib.NewToolResultError("unsupported method: " + method), nil
 		}
@@ -187,6 +209,14 @@ func makeAPIHandler(method, pathTemplate string, bindings []mcpParamBinding, pos
 				}
 			}
 		}
+		if binaryResponse {
+			out, _ := json.Marshal(map[string]any{
+				"content_encoding": "base64",
+				"data_base64":      base64.StdEncoding.EncodeToString(data),
+				"byte_count":       len(data),
+			})
+			return mcplib.NewToolResultText(string(out)), nil
+		}
 		return mcplib.NewToolResultText(string(data)), nil
 	}
 }
@@ -212,6 +242,7 @@ func dbPath() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".local", "share", "mcp-cloudflare-pp-cli", "data.db")
 }
+
 // Note: MCP tools use their own dbPath() because they are in a separate package (main, not cli).
 // The CLI's defaultDBPath() in the cli package uses the same canonical path.
 
@@ -324,20 +355,20 @@ func handleContext(_ context.Context, _ mcplib.CallToolRequest) (*mcplib.CallToo
 			"type": "api_key",
 			"env_vars": []map[string]any{
 				{
-					"name": "MCP_CLOUDFLARE_API_KEY",
-					"kind": "per_call",
-					"required": true,
-					"sensitive": true,
+					"name":        "MCP_CLOUDFLARE_API_KEY",
+					"kind":        "per_call",
+					"required":    true,
+					"sensitive":   true,
 					"description": "Set to your API credential.",
 				},
 			},
 		},
 		"resources": []map[string]any{
 			{
-				"name": "items",
+				"name":        "items",
 				"description": "Manage items",
-				"endpoints": []string{"list",  },
-				"syncable": true,
+				"endpoints":   []string{"list"},
+				"syncable":    true,
 			},
 		},
 		"query_tips": []string{

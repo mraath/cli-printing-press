@@ -18,13 +18,13 @@ func newProjectsListCmd(flags *rootFlags) *cobra.Command {
 	var flagAll bool
 
 	cmd := &cobra.Command{
-		Use:   "list",
-		Short: "List projects",
-		Example: "  printing-press-golden-pp-cli projects list",
+		Use:         "list",
+		Short:       "List projects",
+		Example:     "  printing-press-golden-pp-cli projects list",
 		Annotations: map[string]string{"pp:endpoint": "projects.list", "pp:method": "GET", "pp:path": "/projects", "mcp:read-only": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if cmd.Flags().Changed("status") {
-				allowedStatus := []string{ "draft", "active", "archived" }
+				allowedStatus := []string{"draft", "active", "archived"}
 				validStatus := false
 				for _, v := range allowedStatus {
 					if flagStatus == v {
@@ -44,14 +44,18 @@ func newProjectsListCmd(flags *rootFlags) *cobra.Command {
 			path := "/projects"
 			data, prov, err := resolvePaginatedRead(cmd.Context(), c, flags, "projects", path, map[string]string{
 				"status": fmt.Sprintf("%v", flagStatus),
-				"limit": fmt.Sprintf("%v", flagLimit),
+				"limit":  fmt.Sprintf("%v", flagLimit),
 				"cursor": fmt.Sprintf("%v", flagCursor),
 			}, nil, flagAll, "cursor", "", "")
 			if err != nil {
 				return classifyAPIError(err, flags)
 			}
-			// Print provenance to stderr for human-facing output
-			{
+			// Print provenance to stderr for human-facing output only.
+			// Machine-format flags (--json, --csv, --compact, --quiet, --plain,
+			// --select) and piped stdout suppress this line; the JSON envelope
+			// already carries meta.source for those consumers.
+			// SYNC: keep this gate aligned with command_promoted.go.tmpl.
+			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var countItems []json.RawMessage
 				_ = json.Unmarshal(data, &countItems)
 				printProvenance(cmd, len(countItems), prov)

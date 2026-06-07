@@ -6,13 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -22,6 +19,7 @@ import (
 	"github.com/mvanhorn/cli-printing-press/v4/internal/artifacts"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/browsersniff"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/catalog"
+	"github.com/mvanhorn/cli-printing-press/v4/internal/catalogmeta"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/docspec"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/generator"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/graphql"
@@ -142,6 +140,9 @@ func newGenerateCmd() *cobra.Command {
 				}
 				if err != nil {
 					return &ExitError{Code: ExitSpecError, Err: fmt.Errorf("generating spec from docs: %w", err)}
+				}
+				if docSpec.BaseURLIsPlaceholder {
+					return &ExitError{Code: ExitSpecError, Err: fmt.Errorf("doc scrape of %s found no API base URL; the generator refuses to ship a CLI whose `doctor` would DNS-fail on every call. Re-run with docs that include the API host, or supply a real --base-url via crowd-sniff", docsURL)}
 				}
 				docYAML, err := yaml.Marshal(docSpec)
 				if err != nil {
@@ -294,15 +295,29 @@ func newGenerateCmd() *cobra.Command {
 					return &ExitError{Code: ExitSpecError, Err: fmt.Errorf("parsing spec %s: %w", specFile, err)}
 				}
 
+				enrichSpecFromCatalog(apiSpec, catalogSpecLookupRefs(specFiles, specURL)...)
+				if apiSpec.BaseURLIsPlaceholder {
+					return &ExitError{Code: ExitSpecError, Err: fmt.Errorf("spec %s declares no `servers:` block and no per-operation servers; the generator cannot resolve a real base URL and refuses to ship a CLI whose `doctor` would DNS-fail on every call. Add a `servers:` block with the real API host, or run via crowd-sniff with `--base-url` to supply one", specFile)}
+				}
+
 				specs = append(specs, apiSpec)
 			}
 
 			var apiSpec *spec.APISpec
 			if len(specs) == 1 {
 				apiSpec = specs[0]
-				// Override spec-derived name when --name is explicitly provided
+				// Override spec-derived name when --name is explicitly provided.
+				// When --name is empty but --research-dir points at a state.json
+				// whose api_name slug differs from the title-derived name (e.g.
+				// "Canvas LMS API" → `canvas-lms` vs the user's intended
+				// `canvas`), prefer the state.json slug so the generated
+				// cmd/<slug>-pp-cli matches what manifest/publish-validate look
+				// for. Explicit --name still wins.
 				if cliName != "" {
+					catalogmeta.RebaseAuthEnvPrefix(&apiSpec.Auth, apiSpec.Name, cliName)
 					apiSpec.Name = cliName
+				} else if researchName := pipeline.LoadAPINameFromResearchDir(researchDir); researchName != "" {
+					apiSpec.Name = researchName
 				}
 			} else {
 				if cliName == "" {
@@ -379,15 +394,10 @@ func newGenerateCmd() *cobra.Command {
 				fmt.Fprintf(os.Stderr, "warning: could not write manifest: %v\n", err)
 			}
 
-			// Archive the input spec alongside the CLI for reproducibility.
-			// The spec_url may change or disappear; this local copy is the
-			// only guaranteed way to regenerate from the exact same input.
-			if len(specRawBytes) > 0 {
-				archiveName := "spec.yaml"
-				if json.Valid(specRawBytes[0]) {
-					archiveName = "spec.json"
-				}
-				data := artifacts.RedactArchivedSpecSecrets(specRawBytes[0])
+			// Archive a snapshot of the spec alongside the CLI; multi-spec
+			// runs use the merged form (see archiveSpecBytes for why).
+			if archiveBytes, archiveName, ok := archiveSpecBytes(apiSpec, specs, specRawBytes); ok {
+				data := artifacts.RedactArchivedSpecSecrets(archiveBytes)
 				if err := os.WriteFile(filepath.Join(absOut, archiveName), data, 0o644); err != nil {
 					fmt.Fprintf(os.Stderr, "warning: could not archive spec: %v\n", err)
 				}
@@ -683,13 +693,7 @@ func inferTrafficAnalysisPath(specFiles []string, specSource string) string {
 }
 
 func readSpec(specFile string, refresh bool, skipCache bool) ([]byte, error) {
-	var data []byte
-	var err error
-	if openapi.IsRemoteSpecSource(specFile) {
-		data, err = fetchOrCacheSpec(specFile, refresh, skipCache)
-	} else {
-		data, err = os.ReadFile(specFile)
-	}
+	data, err := openapi.LoadSpecBytes(specFile, refresh, skipCache)
 	if err != nil {
 		return nil, err
 	}
@@ -710,6 +714,43 @@ func parseOpenAPISpec(specFile string, data []byte, lenient bool) (*spec.APISpec
 		return openapi.ParseWithPathLenient(data, specFile)
 	}
 	return openapi.ParseWithPath(data, specFile)
+}
+
+// archiveSpecBytes picks the bytes and filename for the spec snapshot that
+// generate writes alongside the CLI. Single-spec runs preserve the user's
+// original input (post-redaction at the call site) so audit/replay round-trip
+// against the same bytes the parser saw. Multi-spec runs serialize the merged
+// APISpec — its union of paths, merged title, and merged x-mcp config — so
+// downstream consumers that re-read this snapshot operate on the surface the
+// generator actually emitted rather than on whichever input happened to be
+// passed first.
+//
+// Returns ok=false when there is nothing to archive (no inputs) or when
+// marshalling the merged spec failed; the call site logs and continues so a
+// transient archive failure does not abort generation.
+func archiveSpecBytes(apiSpec *spec.APISpec, specs []*spec.APISpec, specRawBytes [][]byte) ([]byte, string, bool) {
+	if len(specs) > 1 {
+		// json.MarshalIndent on a nil pointer succeeds with the literal
+		// "null" bytes, which would write a syntactically-valid but
+		// useless snapshot. Surface the precondition explicitly.
+		if apiSpec == nil {
+			return nil, "", false
+		}
+		data, err := json.MarshalIndent(apiSpec, "", "  ")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: could not marshal merged spec for archive: %v\n", err)
+			return nil, "", false
+		}
+		return data, "spec.json", true
+	}
+	if len(specRawBytes) == 0 {
+		return nil, "", false
+	}
+	raw := specRawBytes[0]
+	if json.Valid(raw) {
+		return raw, "spec.json", true
+	}
+	return raw, "spec.yaml", true
 }
 
 func mergeSpecs(specs []*spec.APISpec, name string) *spec.APISpec {
@@ -779,6 +820,10 @@ func mergeSpecs(specs []*spec.APISpec, name string) *spec.APISpec {
 
 		if s.Auth.AuthorizationURL != "" && merged.Auth.AuthorizationURL == "" {
 			merged.Auth = s.Auth
+		}
+
+		if mcpConfigured(s.MCP) && !mcpConfigured(merged.MCP) {
+			merged.MCP = s.MCP
 		}
 	}
 
@@ -1229,80 +1274,6 @@ func refuseSymlinkedEntries(dir, label string) error {
 	return nil
 }
 
-func fetchOrCacheSpec(specURL string, refresh bool, skipCache bool) ([]byte, error) {
-	sum := sha256.Sum256([]byte(specURL))
-	cacheKey := hex.EncodeToString(sum[:])
-
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		return nil, fmt.Errorf("finding user home directory: %w", err)
-	}
-
-	cacheDir := filepath.Join(homeDir, ".cache", "printing-press", "specs")
-	cachePath := filepath.Join(cacheDir, cacheKey+".json")
-
-	// Read from existing cache even in dry-run mode (no writes needed)
-	if !refresh {
-		info, err := os.Stat(cachePath)
-		switch {
-		case err == nil && time.Since(info.ModTime()) < 24*time.Hour:
-			fmt.Fprintf(os.Stderr, "Using cached spec for %s\n", specURL)
-			data, readErr := os.ReadFile(cachePath)
-			if readErr != nil {
-				return nil, fmt.Errorf("reading cached spec: %w", readErr)
-			}
-			return data, nil
-		case err != nil && !os.IsNotExist(err):
-			return nil, fmt.Errorf("checking cached spec: %w", err)
-		}
-	}
-
-	fmt.Fprintf(os.Stderr, "Fetching spec from %s...\n", specURL)
-	resp, err := http.Get(specURL)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return nil, fmt.Errorf("unexpected response status: %s", resp.Status)
-	}
-
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("reading response body: %w", err)
-	}
-
-	// Content-validity check: reject responses that look like error pages
-	// instead of feeding them to the parser (which emits confusing errors).
-	if len(data) < 256 {
-		trimmed := strings.TrimSpace(string(data))
-		if strings.HasPrefix(trimmed, "<") ||
-			regexp.MustCompile(`^\d{3}:\s`).MatchString(trimmed) {
-			return nil, fmt.Errorf("spec_url %s returned a small response that does not look like an OpenAPI spec (%d bytes): %q",
-				specURL, len(data), trunc50(trimmed))
-		}
-	}
-
-	if !skipCache {
-		if err := os.MkdirAll(cacheDir, 0o755); err != nil {
-			return nil, fmt.Errorf("creating cache directory: %w", err)
-		}
-		if err := os.WriteFile(cachePath, data, 0o644); err != nil {
-			return nil, fmt.Errorf("writing cached spec: %w", err)
-		}
-	}
-
-	return data, nil
-}
-
-func trunc50(s string) string {
-	if len(s) > 50 {
-		return s[:50] + "..."
-	}
-	return s
-}
-
 func newVersionCmd() *cobra.Command {
 	var asJSON bool
 
@@ -1596,6 +1567,10 @@ func enrichSpecFromCatalogEntry(apiSpec *spec.APISpec, entry *catalog.Entry) {
 	if entry.Homepage != "" && apiSpec.WebsiteURL == "" {
 		apiSpec.WebsiteURL = entry.Homepage
 	}
+	if entry.BaseURL != "" && catalogmeta.IsReplaceableBaseURL(apiSpec.BaseURL, apiSpec.BaseURLIsPlaceholder) {
+		apiSpec.BaseURL = strings.TrimRight(entry.BaseURL, "/")
+		apiSpec.BaseURLIsPlaceholder = false
+	}
 	if entry.Category != "" && apiSpec.Category == "" {
 		apiSpec.Category = entry.Category
 	}
@@ -1627,6 +1602,7 @@ func enrichSpecFromCatalogEntry(apiSpec *spec.APISpec, entry *catalog.Entry) {
 	if entry.AuthInstructions != "" && apiSpec.Auth.Type != "none" {
 		apiSpec.Auth.Instructions = entry.AuthInstructions
 	}
+	catalogmeta.ApplyCatalogAuthEnvVars(&apiSpec.Auth, entry.AuthEnvVars)
 }
 
 func mcpConfigured(m spec.MCPConfig) bool {

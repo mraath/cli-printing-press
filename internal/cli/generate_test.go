@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/mvanhorn/cli-printing-press/v4/internal/catalog"
+	"github.com/mvanhorn/cli-printing-press/v4/internal/catalogmeta"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/pipeline"
 	"github.com/mvanhorn/cli-printing-press/v4/internal/spec"
 	"github.com/stretchr/testify/assert"
@@ -767,7 +768,7 @@ resources:
 
 	agentContext, err := os.ReadFile(filepath.Join(outputDir, "internal", "cli", "agent_context.go"))
 	require.NoError(t, err)
-	assert.Contains(t, string(agentContext), `Reachability:  "browser_clearance_http (90% confidence)"`)
+	assert.Regexp(t, `Reachability:\s+"browser_clearance_http \(90% confidence\)"`, string(agentContext))
 }
 
 func TestGenerateCmdDoesNotRequireBrowserProofForPostOnlyClearance(t *testing.T) {
@@ -1017,6 +1018,181 @@ resources:
 
 }
 
+// TestGenerateArchivesMergedSpecForMultiSpec asserts that a generate run
+// with multiple --spec inputs archives the merged in-memory APISpec — with
+// the merged title and the union of resources — rather than just the first
+// input's raw bytes.
+func TestGenerateArchivesMergedSpecForMultiSpec(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	coreSpecPath := filepath.Join(dir, "core.yaml")
+	wikiSpecPath := filepath.Join(dir, "wiki.yaml")
+	outputDir := filepath.Join(dir, "combo")
+	require.NoError(t, os.WriteFile(coreSpecPath, []byte(`name: core
+description: Core API
+version: 0.1.0
+base_url: https://tenant.example.com
+auth:
+  type: none
+resources:
+  projects:
+    description: Projects
+    endpoints:
+      list:
+        method: GET
+        path: /projects
+        description: List projects
+`), 0o644))
+	require.NoError(t, os.WriteFile(wikiSpecPath, []byte(`name: wiki
+description: Wiki API
+version: 0.1.0
+base_url: https://tenant.example.com/wiki/api/v2
+auth:
+  type: none
+resources:
+  pages:
+    description: Pages
+    endpoints:
+      list:
+        method: GET
+        path: /pages
+        description: List pages
+`), 0o644))
+
+	cmd := newGenerateCmd()
+	cmd.SetArgs([]string{
+		"--spec", coreSpecPath,
+		"--spec", wikiSpecPath,
+		"--name", "combo",
+		"--output", outputDir,
+		"--validate=false",
+		"--force",
+	})
+	require.NoError(t, cmd.Execute())
+
+	// Multi-spec must archive as spec.json (canonical JSON of merged APISpec),
+	// not spec.yaml (which would be the first input verbatim).
+	assert.NoFileExists(t, filepath.Join(outputDir, "spec.yaml"))
+	archived, err := os.ReadFile(filepath.Join(outputDir, "spec.json"))
+	require.NoError(t, err)
+
+	parsed, err := spec.ParseBytes(archived)
+	require.NoError(t, err, "archived merged spec must round-trip through spec.ParseBytes")
+
+	// The merged title is the --name, not "core" (the first input).
+	assert.Equal(t, "combo", parsed.Name)
+
+	// The merged BaseURL pins the archive to the merged struct rather than to
+	// either input alone — both inputs share https://tenant.example.com as the
+	// host, and that is what mergeSpecs resolves to.
+	assert.Equal(t, "https://tenant.example.com", parsed.BaseURL, "archived merged spec carries the merged BaseURL")
+
+	// Both inputs' resources are present in the archived snapshot.
+	assert.Contains(t, parsed.Resources, "projects", "first-input resource preserved")
+	assert.Contains(t, parsed.Resources, "pages", "second-input resource present in merged archive")
+}
+
+// TestArchiveSpecBytesBranches covers each branch of archiveSpecBytes
+// directly, including the json-input single-spec arm that the integration
+// tests above don't exercise (their fixtures are YAML).
+func TestArchiveSpecBytesBranches(t *testing.T) {
+	t.Parallel()
+
+	t.Run("multi-spec marshals merged APISpec as JSON", func(t *testing.T) {
+		merged := &spec.APISpec{
+			Name:      "combo",
+			Version:   "0.1.0",
+			BaseURL:   "https://example.com",
+			Resources: map[string]spec.Resource{"things": {Description: "Things"}},
+		}
+		specs := []*spec.APISpec{
+			{Name: "a", Resources: map[string]spec.Resource{}},
+			{Name: "b", Resources: map[string]spec.Resource{}},
+		}
+		data, name, ok := archiveSpecBytes(merged, specs, [][]byte{[]byte("a"), []byte("b")})
+		require.True(t, ok)
+		assert.Equal(t, "spec.json", name)
+		assert.True(t, json.Valid(data), "multi-spec archive must be valid JSON")
+		assert.Contains(t, string(data), `"name": "combo"`)
+	})
+
+	t.Run("single-spec JSON input returns raw bytes as spec.json", func(t *testing.T) {
+		jsonInput := []byte(`{"name":"solo","resources":{}}`)
+		data, name, ok := archiveSpecBytes(nil, []*spec.APISpec{{Name: "solo"}}, [][]byte{jsonInput})
+		require.True(t, ok)
+		assert.Equal(t, "spec.json", name)
+		assert.Equal(t, jsonInput, data, "single-spec JSON archive is byte-identical to input")
+	})
+
+	t.Run("single-spec YAML input returns raw bytes as spec.yaml", func(t *testing.T) {
+		yamlInput := []byte("name: solo\nresources: {}\n")
+		data, name, ok := archiveSpecBytes(nil, []*spec.APISpec{{Name: "solo"}}, [][]byte{yamlInput})
+		require.True(t, ok)
+		assert.Equal(t, "spec.yaml", name)
+		assert.Equal(t, yamlInput, data, "single-spec YAML archive is byte-identical to input")
+	})
+
+	t.Run("no inputs returns ok=false", func(t *testing.T) {
+		_, _, ok := archiveSpecBytes(nil, nil, nil)
+		assert.False(t, ok)
+	})
+
+	t.Run("multi-spec with nil apiSpec returns ok=false", func(t *testing.T) {
+		specs := []*spec.APISpec{
+			{Name: "a"},
+			{Name: "b"},
+		}
+		_, _, ok := archiveSpecBytes(nil, specs, [][]byte{[]byte("a"), []byte("b")})
+		assert.False(t, ok, "nil apiSpec must not silently archive the literal 'null'")
+	})
+}
+
+// TestGenerateArchivesRawSpecForSingleSpec asserts that single-spec runs
+// archive the user's original input bytes verbatim (post-redaction), the
+// negative case complementing the multi-spec merged-archive behavior.
+func TestGenerateArchivesRawSpecForSingleSpec(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	specPath := filepath.Join(dir, "spec.yaml")
+	outputDir := filepath.Join(dir, "solo")
+	input := []byte(`name: solo
+description: Solo API
+version: 0.1.0
+base_url: https://api.example.com
+auth:
+  type: none
+resources:
+  things:
+    description: Things
+    endpoints:
+      list:
+        method: GET
+        path: /things
+        description: List things
+`)
+	require.NoError(t, os.WriteFile(specPath, input, 0o644))
+
+	cmd := newGenerateCmd()
+	cmd.SetArgs([]string{
+		"--spec", specPath,
+		"--output", outputDir,
+		"--validate=false",
+		"--force",
+	})
+	require.NoError(t, cmd.Execute())
+
+	// YAML input archives as spec.yaml (not spec.json).
+	assert.NoFileExists(t, filepath.Join(outputDir, "spec.json"))
+	archived, err := os.ReadFile(filepath.Join(outputDir, "spec.yaml"))
+	require.NoError(t, err)
+
+	// Single-spec archive is byte-identical to the input (this spec contains
+	// no secrets, so redaction is a no-op).
+	assert.Equal(t, input, archived, "single-spec archive must preserve original bytes")
+}
+
 func TestMergeSpecsPrefersReplayableBrowserTransportOverUnshippablePageContext(t *testing.T) {
 	t.Parallel()
 
@@ -1209,6 +1385,136 @@ func TestMergeSpecsLeavesPathsUnchangedWhenHostsDiffer(t *testing.T) {
 	assert.Equal(t, "https://a.example.com", merged.BaseURL)
 	assert.Equal(t, "/foo", merged.Resources["foo"].Endpoints["list"].Path)
 	assert.Equal(t, "/bar", merged.Resources["bar"].Endpoints["list"].Path)
+}
+
+// TestMergeSpecsCarriesMCPConfigFromFirstDeclaringSpec verifies that a combo
+// run preserves x-mcp configuration from the first input spec that declares
+// it. Without this precedence loop, mergeSpecs silently drops MCP config and
+// the downstream code-orchestration gate falls back to the endpoint-mirror
+// surface no matter what the input specs requested.
+func TestMergeSpecsCarriesMCPConfigFromFirstDeclaringSpec(t *testing.T) {
+	t.Parallel()
+
+	specA := &spec.APISpec{
+		Name:      "a",
+		Version:   "0.1.0",
+		BaseURL:   "https://api.example.com",
+		Resources: map[string]spec.Resource{},
+		Types:     map[string]spec.TypeDef{},
+	}
+	specB := &spec.APISpec{
+		Name:      "b",
+		Version:   "0.1.0",
+		BaseURL:   "https://api.example.com",
+		Resources: map[string]spec.Resource{},
+		Types:     map[string]spec.TypeDef{},
+		MCP: spec.MCPConfig{
+			Orchestration: "code",
+		},
+	}
+
+	merged := mergeSpecs([]*spec.APISpec{specA, specB}, "combo")
+
+	assert.True(t, merged.MCP.IsCodeOrchestration(), "merged MCP should retain x-mcp.orchestration=code from specB")
+}
+
+// TestMergeSpecsLeavesMCPZeroWhenNoSpecDeclares verifies that combos without
+// any x-mcp declaration produce a zero-valued merged MCP, so the existing
+// endpoint-mirror default and "consider code-orchestration" advisory keep
+// working unchanged.
+func TestMergeSpecsLeavesMCPZeroWhenNoSpecDeclares(t *testing.T) {
+	t.Parallel()
+
+	specA := &spec.APISpec{
+		Name:      "a",
+		Version:   "0.1.0",
+		BaseURL:   "https://api.example.com",
+		Resources: map[string]spec.Resource{},
+		Types:     map[string]spec.TypeDef{},
+	}
+	specB := &spec.APISpec{
+		Name:      "b",
+		Version:   "0.1.0",
+		BaseURL:   "https://api.example.com",
+		Resources: map[string]spec.Resource{},
+		Types:     map[string]spec.TypeDef{},
+	}
+
+	merged := mergeSpecs([]*spec.APISpec{specA, specB}, "combo")
+
+	assert.False(t, merged.MCP.IsCodeOrchestration())
+	assert.Empty(t, merged.MCP.Transport)
+	assert.Empty(t, merged.MCP.Intents)
+}
+
+// TestMergeSpecsCarriesMCPFullFieldsFromDeclaringSpec exercises the merge
+// loop with a non-Orchestration trigger field (Transport) and asserts that
+// Addr and Intents propagate alongside it. Without this case, a regression to
+// a partial field-by-field copy or an mcpConfigured branch that ignored
+// non-Orchestration fields would slip past the other tests.
+func TestMergeSpecsCarriesMCPFullFieldsFromDeclaringSpec(t *testing.T) {
+	t.Parallel()
+
+	specA := &spec.APISpec{
+		Name:      "a",
+		Version:   "0.1.0",
+		BaseURL:   "https://api.example.com",
+		Resources: map[string]spec.Resource{},
+		Types:     map[string]spec.TypeDef{},
+		MCP: spec.MCPConfig{
+			Transport: []string{"stdio", "http"},
+			Addr:      ":7777",
+			Intents: []spec.Intent{
+				{Name: "search_things"},
+			},
+		},
+	}
+	specB := &spec.APISpec{
+		Name:      "b",
+		Version:   "0.1.0",
+		BaseURL:   "https://api.example.com",
+		Resources: map[string]spec.Resource{},
+		Types:     map[string]spec.TypeDef{},
+	}
+
+	merged := mergeSpecs([]*spec.APISpec{specA, specB}, "combo")
+
+	assert.Equal(t, []string{"stdio", "http"}, merged.MCP.Transport)
+	assert.Equal(t, ":7777", merged.MCP.Addr)
+	assert.Len(t, merged.MCP.Intents, 1)
+	assert.Equal(t, "search_things", merged.MCP.Intents[0].Name)
+}
+
+// TestMergeSpecsFirstDeclaringMCPWins verifies that when more than one input
+// spec declares x-mcp, the first declaring spec wins, mirroring the existing
+// first-wins precedence used for Auth.AuthorizationURL.
+func TestMergeSpecsFirstDeclaringMCPWins(t *testing.T) {
+	t.Parallel()
+
+	specA := &spec.APISpec{
+		Name:      "a",
+		Version:   "0.1.0",
+		BaseURL:   "https://api.example.com",
+		Resources: map[string]spec.Resource{},
+		Types:     map[string]spec.TypeDef{},
+		MCP: spec.MCPConfig{
+			Orchestration: "code",
+		},
+	}
+	specB := &spec.APISpec{
+		Name:      "b",
+		Version:   "0.1.0",
+		BaseURL:   "https://api.example.com",
+		Resources: map[string]spec.Resource{},
+		Types:     map[string]spec.TypeDef{},
+		MCP: spec.MCPConfig{
+			Orchestration: "intent",
+		},
+	}
+
+	merged := mergeSpecs([]*spec.APISpec{specA, specB}, "combo")
+
+	assert.Equal(t, "code", merged.MCP.Orchestration)
 }
 
 func TestNormalizeHTTPTransportAllowsBrowserChromeH3(t *testing.T) {
@@ -1510,11 +1816,12 @@ resources:
 }
 
 func TestEnrichSpecFromCatalogCopiesGenerationMetadata(t *testing.T) {
-	apiSpec := &spec.APISpec{Name: "test-api"}
+	apiSpec := &spec.APISpec{Name: "test-api", BaseURL: spec.PlaceholderBaseURL, BaseURLIsPlaceholder: true}
 
 	enrichSpecFromCatalogEntry(apiSpec, &catalog.Entry{
 		DisplayName: "Test.API",
 		OwnerName:   "Trevin Chow",
+		BaseURL:     "https://api.example.com/",
 		MCP: spec.MCPConfig{
 			Transport:     []string{"stdio", "http"},
 			Orchestration: "code",
@@ -1524,9 +1831,27 @@ func TestEnrichSpecFromCatalogCopiesGenerationMetadata(t *testing.T) {
 
 	assert.Equal(t, "Test.API", apiSpec.DisplayName)
 	assert.Equal(t, "Trevin Chow", apiSpec.OwnerName)
+	assert.Equal(t, "https://api.example.com", apiSpec.BaseURL)
+	assert.False(t, apiSpec.BaseURLIsPlaceholder)
 	assert.Equal(t, []string{"stdio", "http"}, apiSpec.MCP.Transport)
 	assert.Equal(t, "code", apiSpec.MCP.Orchestration)
 	assert.Equal(t, "hidden", apiSpec.MCP.EndpointTools)
+}
+
+func TestRebaseAuthEnvPrefix(t *testing.T) {
+	auth := spec.AuthConfig{
+		EnvVars: []string{"ELEVENLABS_DOCUMENTATION_API_KEY", "UNCHANGED_TOKEN"},
+		EnvVarSpecs: []spec.AuthEnvVar{
+			{Name: "ELEVENLABS_DOCUMENTATION_CLIENT_ID"},
+			{Name: "CUSTOM_SECRET"},
+		},
+	}
+
+	catalogmeta.RebaseAuthEnvPrefix(&auth, "elevenlabs-documentation", "elevenlabs")
+
+	assert.Equal(t, []string{"ELEVENLABS_API_KEY", "UNCHANGED_TOKEN"}, auth.EnvVars)
+	assert.Equal(t, "ELEVENLABS_CLIENT_ID", auth.EnvVarSpecs[0].Name)
+	assert.Equal(t, "CUSTOM_SECRET", auth.EnvVarSpecs[1].Name)
 }
 
 func TestEnrichSpecFromCatalogMatchesSpecURLWhenSlugDiffers(t *testing.T) {
@@ -1578,4 +1903,43 @@ func runGoCommandForCLITest(t *testing.T, dir string, args ...string) {
 	cmd.Dir = dir
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
+}
+
+// TestGenerateCmdRefusesPlaceholderBaseURL pins the contract that the
+// generate command halts when the spec declares neither `servers:` nor
+// any per-operation server. The parser falls back to a fake hostname so
+// the spec keeps parsing, but the generate command must refuse to write
+// a CLI whose `doctor` would DNS-fail on every call.
+func TestGenerateCmdRefusesPlaceholderBaseURL(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	specPath := filepath.Join(dir, "spec.yaml")
+	outputDir := filepath.Join(dir, "noserversapp")
+	require.NoError(t, os.WriteFile(specPath, []byte(`openapi: "3.0.3"
+info:
+  title: No Servers App
+  version: "1.0"
+paths:
+  /things:
+    get:
+      operationId: listThings
+      responses:
+        '200':
+          description: OK
+`), 0o644))
+
+	cmd := newGenerateCmd()
+	cmd.SetArgs([]string{
+		"--spec", specPath,
+		"--output", outputDir,
+		"--validate=false",
+		"--force",
+	})
+
+	err := cmd.Execute()
+	require.Error(t, err, "expected generate to refuse a spec without servers")
+	assert.Contains(t, err.Error(), specPath, "error must name the offending spec file")
+	assert.Contains(t, err.Error(), "no `servers:`", "error must explain that the spec declares no servers")
+	assert.NoDirExists(t, outputDir, "refusal must fire before any output is written")
 }

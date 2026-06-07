@@ -25,13 +25,11 @@ Publish a generated CLI from your local library to the [printing-press-library](
 
 The public library treats `library/<category>/<api-slug>/.printing-press.json`
 and `manifest.json` as the source of truth for registry-display fields. Do not
-edit `registry.json` or README catalog cells in publish PRs; the library's
-post-merge workflow refreshes them from the CLI tree. Do regenerate and commit
-the `cli-skills/pp-<api-slug>/SKILL.md` mirror from
-`library/<category>/<api-slug>/SKILL.md` because PR CI verifies mirror parity.
-If a brand-new CLI's mirror is pruned because `registry.json` is behind, fix the
-library mirror generator to discover from `library/`; do not add a registry
-entry solely to satisfy mirror parity.
+edit `registry.json`, README catalog cells, or `cli-skills/pp-<api-slug>/SKILL.md`
+in publish PRs; all three are bot-regenerated post-merge by the library's own
+workflows. The library's `Guard against hand-edits to cli-skills mirror` check
+rejects any fork PR whose commits touch the mirror, so a publish that includes
+the mirror is pre-rejected before review.
 
 ## Setup
 
@@ -46,7 +44,9 @@ _scope_dir="$(git rev-parse --show-toplevel 2>/dev/null || echo "$PWD")"
 _scope_dir="$(cd "$_scope_dir" && pwd -P)"
 
 # Prefer local build when running from inside the printing-press repo.
+_press_repo=false
 if [ -x "$_scope_dir/printing-press" ] && [ -d "$_scope_dir/cmd/printing-press" ]; then
+  _press_repo=true
   export PATH="$_scope_dir:$PATH"
   echo "Using local build: $_scope_dir/printing-press"
 elif ! command -v printing-press >/dev/null 2>&1; then
@@ -59,6 +59,19 @@ elif ! command -v printing-press >/dev/null 2>&1; then
   fi
   return 1 2>/dev/null || exit 1
 fi
+
+# Resolve and emit the absolute path the agent must use for every later
+# `printing-press` invocation. `export PATH` above only affects this one
+# Bash tool call; subsequent calls open a fresh shell and resolve bare
+# `printing-press` against the user's default PATH, where a stale global
+# can silently shadow the local build. The agent captures this marker and
+# substitutes the absolute path into every later invocation.
+if [ "$_press_repo" = "true" ]; then
+  PRINTING_PRESS_BIN="$_scope_dir/printing-press"
+else
+  PRINTING_PRESS_BIN="$(command -v printing-press 2>/dev/null || true)"
+fi
+echo "PRINTING_PRESS_BIN=$PRINTING_PRESS_BIN"
 
 PRESS_BASE="$(basename "$_scope_dir" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_-]/-/g; s/^-+//; s/-+$//')"
 if [ -z "$PRESS_BASE" ]; then
@@ -76,7 +89,9 @@ mkdir -p "$PRESS_RUNSTATE" "$PRESS_LIBRARY" "$PRESS_MANUSCRIPTS" "$PRESS_CURRENT
 ```
 <!-- PRESS_SETUP_CONTRACT_END -->
 
-After running the setup contract, check binary version compatibility. Read the `min-binary-version` field from this skill's YAML frontmatter. Run `printing-press version --json` and parse the version from the output. Compare it to `min-binary-version` using semver rules. If the installed binary is older than the minimum, stop immediately and tell the user: "printing-press binary vX.Y.Z is older than the minimum required vA.B.C. Run `go install github.com/mvanhorn/cli-printing-press/v4/cmd/printing-press@latest` to update."
+After running the setup contract, capture the `PRINTING_PRESS_BIN=<abs-path>` line from stdout. **Every subsequent `printing-press ...` invocation in this skill must use that absolute path** (substitute the value, not the literal `$PRINTING_PRESS_BIN` token) — `export PATH` above only affects the single Bash tool call it runs in, so later calls open a fresh shell where bare `printing-press` resolves against the user's default `PATH` and a stale global can shadow the local build.
+
+After capturing the binary path, check binary version compatibility. Read the `min-binary-version` field from this skill's YAML frontmatter. Run `<PRINTING_PRESS_BIN> version --json` and parse the version from the output. Compare it to `min-binary-version` using semver rules. If the installed binary is older than the minimum, stop immediately and tell the user: "printing-press binary vX.Y.Z is older than the minimum required vA.B.C. Run `go install github.com/mvanhorn/cli-printing-press/v4/cmd/printing-press@latest` to update."
 
 ## Configuration
 
@@ -417,10 +432,15 @@ Then copy the staged CLI into the publish repo, replacing any existing version:
 rm -rf "$PUBLISH_REPO_DIR/library"/*/"<api-slug>"
 
 # Copy staged CLI into publish repo (slug-keyed directory)
-cp -r "$STAGING_DIR/library/<category>/<cli-name>" "$PUBLISH_REPO_DIR/library/<category>/<api-slug>"
+cp -r "$STAGING_DIR/library/<category>/<api-slug>" "$PUBLISH_REPO_DIR/library/<category>/<api-slug>"
 
-# Remove binaries (should not be committed)
-rm -f "$PUBLISH_REPO_DIR/library/<category>/<api-slug>/<api-slug>" "$PUBLISH_REPO_DIR/library/<category>/<api-slug>/<cli-name>"
+# Remove root-level binaries (should not be committed). publish package
+# already strips these before the copy; this rm -f is belt-and-suspenders
+# for the agent path. Cover all three names the Makefile/`go build ./cmd/...`
+# can drop: bare slug, CLI binary, MCP peer.
+rm -f "$PUBLISH_REPO_DIR/library/<category>/<api-slug>/<api-slug>" \
+      "$PUBLISH_REPO_DIR/library/<category>/<api-slug>/<cli-name>" \
+      "$PUBLISH_REPO_DIR/library/<category>/<api-slug>/<api-slug>-pp-mcp"
 
 # Defense-in-depth: validate printer attribution before README and registry surfaces.
 PRINTER=$(jq -r '.printer // ""' "$PUBLISH_REPO_DIR/library/<category>/<api-slug>/.printing-press.json")
@@ -438,10 +458,15 @@ if [ -z "$PRINTER_NAME" ]; then
   exit 1
 fi
 
-# Regenerate the flat cli-skills mirror from the library tree so library PR CI passes mirror parity.
-if [ -f "$PUBLISH_REPO_DIR/tools/generate-skills/main.go" ]; then
-  (cd "$PUBLISH_REPO_DIR" && go run ./tools/generate-skills/main.go)
-fi
+# Do NOT regenerate or commit `cli-skills/pp-<api-slug>/SKILL.md` here. The
+# mirror is auto-regenerated post-merge by the library's `generate-skills.yml`
+# workflow via a `[skip ci]` bot commit. Including the mirror in a fork PR is
+# pre-rejected by the library's `Guard against hand-edits to cli-skills mirror`
+# check, which fails on any non-bot commit touching the mirror. Same-repo PRs
+# are auto-handled by the library's `Commit generated convention fixes` step,
+# which is gated on `head.repo.full_name == github.repository`. Do not
+# re-introduce a mirror-regenerator invocation here unless the library's
+# Guard check has been loosened to accept publish-flow commits.
 
 # Verify this changed/new CLI builds and has no reachable Go vulnerabilities from the publish repo
 cd "$PUBLISH_REPO_DIR/library/<category>/<api-slug>" \
@@ -462,7 +487,7 @@ directory:
 rm -rf "$STAGING_PARENT"
 ```
 
-Note: `staged_dir` uses the CLI name (e.g., `espn-pp-cli`) but the publish repo uses the API slug (e.g., `espn`). The copy step handles this rename.
+Note: `staged_dir` is keyed by the API slug (e.g., `espn`), matching the publish repo's directory layout. The copy step is a same-name copy, not a rename.
 
 ## Step 7: Collision Detection & Resolution
 
@@ -710,7 +735,7 @@ git checkout -B feat/<api-slug>
 
 ```bash
 cd "$PUBLISH_REPO_DIR"
-git add library/ cli-skills/
+git add library/
 git commit -m "feat(<api-slug>): add <api-slug>"
 ```
 
@@ -734,6 +759,16 @@ git push --force-with-lease -u origin feat/<api-slug>
 git push -u origin feat/<api-slug>
 ```
 
+### Capture the pushed commit SHA
+
+After pushing, capture the head commit SHA. This is used to build durable manuscript links in the PR body (see "Build the PR description" below).
+
+```bash
+HEAD_SHA=$(git rev-parse HEAD)
+```
+
+The SHA stays resolvable on `mvanhorn/printing-press-library` for the life of the PR (GitHub mirrors fork-PR head commits to `refs/pull/<N>/head` on the upstream), and remains valid after the PR is merged and the branch is deleted. Each invocation of this skill captures a fresh `HEAD_SHA` after its push and rewrites the body, so links stay current across updates the skill performs. If the branch is force-pushed outside this skill, re-run `/printing-press-publish` to refresh the body — the prior links will still resolve, but they'll point at the manuscript contents from before the out-of-band push.
+
 ### Create or update PR
 
 Read `access` and `gh_user` from `$PUBLISH_CONFIG`. These determine how `gh pr create` is called.
@@ -747,13 +782,13 @@ Build the PR description from:
 - The manifest's `novel_features` array from the packaged CLI after Step 6
 - The `help_output` captured in Step 4
 - The CLI's README (first 2-3 paragraphs, or note that README is missing)
-- Links to `.manuscripts/<run-id>/research/` and `.manuscripts/<run-id>/proofs/` within the PR branch
+- Links to every file under `.manuscripts/<run-id>/research/` and `.manuscripts/<run-id>/proofs/`. Each link must be a full `https://github.com/mvanhorn/printing-press-library/blob/<HEAD_SHA>/library/<category>/<api-slug>/.manuscripts/<run-id>/<subdir>/<filename>` URL — never a relative path (GitHub resolves those against `…/pull/`, producing broken `…/pull/library/…` URLs) and never a directory (the blob view requires a file). Enumerate the actual files; do not invent or skip them.
 - The validation results from Step 4
 - A Gaps section listing any missing manifest fields
 
 Read `novel_features` from
 `$PUBLISH_REPO_DIR/library/<category>/<api-slug>/.printing-press.json` after
-packaging and mirror regeneration. Preserve the manifest order. Do not derive
+packaging. Preserve the manifest order. Do not derive
 this section from README prose, SKILL prose, root help, or memory of the run:
 those surfaces may be summarized or hand-edited, while the packaged manifest is
 the publish-time source of truth. For each entry, include the command, name, and
@@ -821,8 +856,14 @@ $ <cli-name> --help
 
 ### Manuscripts
 
-- [Research Brief](<link to library/<category>/<api-slug>/.manuscripts/<run-id>/research/>)
-- [Shipcheck Results](<link to library/<category>/<api-slug>/.manuscripts/<run-id>/proofs/>)
+<!-- One bullet per file, NOT one per directory. Repeat the research/ row for every file in research/, and the proofs/ row for every file in proofs/. Use a human label that matches the file (e.g. `Research Brief`, `Absorb Manifest`, `Novel Features Brainstorm`, `Phase 5 Acceptance`). Substitute `<HEAD_SHA>` with the value captured after push. Do NOT use relative paths. -->
+
+- [<label>](https://github.com/mvanhorn/printing-press-library/blob/<HEAD_SHA>/library/<category>/<api-slug>/.manuscripts/<run-id>/research/<filename>)
+- [<label>](https://github.com/mvanhorn/printing-press-library/blob/<HEAD_SHA>/library/<category>/<api-slug>/.manuscripts/<run-id>/research/<filename>)
+- … (one bullet for each remaining file in `.manuscripts/<run-id>/research/`)
+- [<label>](https://github.com/mvanhorn/printing-press-library/blob/<HEAD_SHA>/library/<category>/<api-slug>/.manuscripts/<run-id>/proofs/<filename>)
+- [<label>](https://github.com/mvanhorn/printing-press-library/blob/<HEAD_SHA>/library/<category>/<api-slug>/.manuscripts/<run-id>/proofs/<filename>)
+- … (one bullet for each remaining file in `.manuscripts/<run-id>/proofs/`)
 
 ### Validation Results
 
@@ -886,6 +927,20 @@ rm -f "$PR_BODY_FILE"
 ```
 
 Display the full PR URL (e.g., `https://github.com/mvanhorn/printing-press-library/pull/10`), not the shorthand `org/repo#N` format. The full URL is clickable in all terminals and contexts.
+
+## After the PR opens
+
+Once the PR is open, it enters the public library repo's review contract. That contract is owned by [`mvanhorn/printing-press-library` AGENTS.md → "Automated code review with Greptile"](https://github.com/mvanhorn/printing-press-library/blob/main/AGENTS.md#automated-code-review-with-greptile); read it for the canonical version. An agent invoking this skill from `cli-printing-press` will not have loaded the library's AGENTS.md, so the obligations are summarized here:
+
+- **Resolve every Greptile finding.** Read findings from two surfaces — they don't overlap:
+  - `gh pr view <PR> --repo <owner>/<repo> --comments` returns the top-level issue conversation (Greptile's summary comment, score, CI bots).
+  - `gh api repos/<owner>/<repo>/pulls/<PR>/comments` returns the inline diff-anchored review comments — Greptile posts each P0/P1/P2 finding here, **and these are NOT included in `--comments`**. Skipping this call is how an agent silently declares "all findings resolved" while every inline thread is still open.
+
+  For each P0/P1/P2 thread, either push a fix or reply with a concrete reason it shouldn't fire — not "won't fix", but *why* the code is right as written or *why* deferral is justified. The 0-5 score is a confidence signal, not a hard gate; 4/5 and 5/5 are both acceptable end states, and the score will land in that range naturally once threads are addressed.
+- **All CI checks must pass.** `verify-library-conventions`, `Govulncheck`, and any other workflow on the PR must be green before merge.
+- **Don't merge with unresolved threads** even when CI is green and the score looks good.
+- **Don't hand-edit `registry.json` or `cli-skills/pp-<api-slug>/SKILL.md` to satisfy a finding** — both are bot-regenerated post-merge by `[skip ci]` commits and your edits will be overwritten.
+- **Hand off once review-ready.** When all threads are resolved or replied to and CI is green, stop and tell the user. Don't loop polling for the merge; the user owns that decision.
 
 ## Secret & PII Protection
 

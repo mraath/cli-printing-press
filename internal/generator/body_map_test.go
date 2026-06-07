@@ -37,6 +37,28 @@ func TestBodyMap(t *testing.T) {
 				"\t\t\t}\n",
 		},
 		{
+			// Booleans gate on cmd.Flags().Changed instead of the
+			// scalar zero-guard so user-set false reaches the wire
+			// AND untouched flags don't overwrite server state on
+			// PATCH endpoints. See issue #1298.
+			name:   "scalar boolean (internal spec form) gates on Changed, not zero-guard",
+			body:   []spec.Param{{Name: "private", Type: "boolean"}},
+			indent: "\t\t\t",
+			want: "\t\t\tif cmd.Flags().Changed(\"private\") {\n" +
+				"\t\t\t\tbody[\"private\"] = bodyPrivate\n" +
+				"\t\t\t}\n",
+		},
+		{
+			// The OpenAPI parser normalizes "boolean" -> "bool", so the
+			// renderer must match both forms or fail open on OpenAPI specs.
+			name:   "scalar bool (OpenAPI-normalized form) gates on Changed",
+			body:   []spec.Param{{Name: "enabled", Type: "bool"}},
+			indent: "\t\t\t",
+			want: "\t\t\tif cmd.Flags().Changed(\"enabled\") {\n" +
+				"\t\t\t\tbody[\"enabled\"] = bodyEnabled\n" +
+				"\t\t\t}\n",
+		},
+		{
 			name:   "object branch parses JSON and stores parsed value",
 			body:   []spec.Param{{Name: "metadata", Type: "object"}},
 			indent: "\t\t\t",
@@ -174,6 +196,35 @@ func TestBodyMap_NestedObject(t *testing.T) {
 		"\t}\n"
 	if got != want {
 		t.Errorf("bodyMap nested mismatch.\n got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+// TestBodyMap_NestedObject_BooleanLeaf verifies the boolean Changed
+// gate threads through the nested-object recursion: an untouched
+// boolean leaf adds nothing to the inner map, so len(nestedMap) > 0
+// stays false and the parent object key is not emitted. Without this,
+// every PATCH whose body declares a nested object with a boolean leaf
+// would silently send the parent with field=false on every call.
+func TestBodyMap_NestedObject_BooleanLeaf(t *testing.T) {
+	t.Parallel()
+	got := bodyMap([]spec.Param{{
+		Name: "settings",
+		Type: "object",
+		Fields: []spec.Param{
+			{Name: "private", Type: "boolean"},
+		},
+	}}, "\t")
+	want := "\t{\n" +
+		"\t\tnestedSettings := map[string]any{}\n" +
+		"\t\tif cmd.Flags().Changed(\"settings-private\") {\n" +
+		"\t\t\tnestedSettings[\"private\"] = bodySettingsPrivate\n" +
+		"\t\t}\n" +
+		"\t\tif len(nestedSettings) > 0 {\n" +
+		"\t\t\tbody[\"settings\"] = nestedSettings\n" +
+		"\t\t}\n" +
+		"\t}\n"
+	if got != want {
+		t.Errorf("bodyMap nested boolean leaf mismatch.\n got:\n%s\nwant:\n%s", got, want)
 	}
 }
 
@@ -440,5 +491,123 @@ func TestBodyRequiredChecks_TopLevelKeepsAliasOR(t *testing.T) {
 	}, "\t\t\t")
 	if !strings.Contains(got, `(cmd.Flags().Changed("name") || cmd.Flags().Changed("n"))`) {
 		t.Errorf("expected alias-OR in required check, got:\n%s", got)
+	}
+}
+
+// TestBodyJSONFallback_VarDecls emits a single flagBodyJSON string and
+// suppresses per-field var declarations when the endpoint opts into the
+// oneOf/anyOf fallback.
+func TestBodyJSONFallback_VarDecls(t *testing.T) {
+	t.Parallel()
+	got := bodyVarDecls(spec.Endpoint{BodyJSONFallback: true})
+	want := "\n\tvar flagBodyJSON string"
+	if got != want {
+		t.Errorf("bodyVarDecls fallback mismatch.\n got:%q\nwant:%q", got, want)
+	}
+}
+
+// TestBodyJSONFallback_FlagRegs registers a single --body-json flag with
+// user-facing help that also names oneOf/anyOf for spec-aware readers.
+func TestBodyJSONFallback_FlagRegs(t *testing.T) {
+	t.Parallel()
+	got := bodyFlagRegs(spec.Endpoint{BodyJSONFallback: true})
+	if !strings.Contains(got, `cmd.Flags().StringVar(&flagBodyJSON, "body-json"`) {
+		t.Errorf("expected --body-json flag registration, got:\n%s", got)
+	}
+	if !strings.Contains(got, "polymorphic schema") {
+		t.Errorf("expected user-facing help text, got:\n%s", got)
+	}
+	if !strings.Contains(got, "oneOf/anyOf") {
+		t.Errorf("expected spec-aware hint mentioning oneOf/anyOf, got:\n%s", got)
+	}
+}
+
+// TestBodyJSONFallback_RequiredChecks emits no required-flag check
+// because the parser cannot tell whether the request body is mandatory
+// for an opaque schema. An empty body either succeeds or surfaces a
+// clear 400 from the API.
+func TestBodyJSONFallback_RequiredChecks(t *testing.T) {
+	t.Parallel()
+	got := bodyRequiredChecks(spec.Endpoint{BodyJSONFallback: true}, "\t\t\t")
+	if got != "" {
+		t.Errorf("bodyRequiredChecks should emit nothing for BodyJSONFallback, got:%q", got)
+	}
+}
+
+// TestBodyJSONFallback_BodyMap dispatches bodyMapForEndpoint to the
+// JSON-fallback renderer when the endpoint has BodyJSONFallback set.
+// The block must parse the flag, reject non-object payloads, and
+// overwrite the empty body map prepared by the caller.
+func TestBodyJSONFallback_BodyMap(t *testing.T) {
+	t.Parallel()
+	got := bodyMapForEndpoint(spec.Endpoint{BodyJSONFallback: true}, "\t")
+	wantSubstrings := []string{
+		`if flagBodyJSON != ""`,
+		`var parsedBodyJSON any`,
+		`json.Unmarshal([]byte(flagBodyJSON), &parsedBodyJSON)`,
+		`asMap, ok := parsedBodyJSON.(map[string]any)`,
+		`body = asMap`,
+		`--body-json must be a JSON object, got JSON %T`,
+	}
+	for _, s := range wantSubstrings {
+		if !strings.Contains(got, s) {
+			t.Errorf("body-json fallback output missing %q, got:\n%s", s, got)
+		}
+	}
+}
+
+// TestBodyJSONFallback_BodyMap_TypedPath confirms bodyMapForEndpoint
+// falls through to the typed renderer when BodyJSONFallback is false,
+// preserving existing CLIs' generated output.
+func TestBodyJSONFallback_BodyMap_TypedPath(t *testing.T) {
+	t.Parallel()
+	endpoint := spec.Endpoint{Body: []spec.Param{{Name: "name", Type: "string"}}}
+	got := bodyMapForEndpoint(endpoint, "\t")
+	if strings.Contains(got, "flagBodyJSON") {
+		t.Errorf("typed-body path must not emit flagBodyJSON branch, got:\n%s", got)
+	}
+	if !strings.Contains(got, `body["name"] = bodyName`) {
+		t.Errorf("expected typed body-map output for name field, got:\n%s", got)
+	}
+}
+
+// TestMCPParamBindings_BodyJSONFallback inserts a single body_json
+// binding with Location="body_json", mirroring the CLI surface. Parser
+// invariant: Body is empty when BodyJSONFallback is set.
+func TestMCPParamBindings_BodyJSONFallback(t *testing.T) {
+	t.Parallel()
+	endpoint := spec.Endpoint{
+		BodyJSONFallback: true,
+		Params:           []spec.Param{{Name: "zoneId", Type: "string"}},
+	}
+	bindings := mcpParamBindings(endpoint, "/zones/{zoneId}/records")
+
+	var foundBodyJSON, foundTypedBody bool
+	for _, b := range bindings {
+		if b.Location == "body_json" && b.PublicName == "body_json" {
+			foundBodyJSON = true
+		}
+		if b.Location == "body" {
+			foundTypedBody = true
+		}
+	}
+	if !foundBodyJSON {
+		t.Errorf("expected a body_json binding, got: %+v", bindings)
+	}
+	if foundTypedBody {
+		t.Errorf("BodyJSONFallback should suppress per-field body bindings, got: %+v", bindings)
+	}
+}
+
+// TestBodyJSONFallback_RequiredChecks_RequiredBody emits a Changed check
+// on --body-json when the OpenAPI requestBody.required flag was true.
+func TestBodyJSONFallback_RequiredChecks_RequiredBody(t *testing.T) {
+	t.Parallel()
+	got := bodyRequiredChecks(spec.Endpoint{BodyJSONFallback: true, BodyRequired: true}, "\t\t\t")
+	if !strings.Contains(got, `cmd.Flags().Changed("body-json")`) {
+		t.Errorf("expected Changed check on body-json for required body, got:%q", got)
+	}
+	if !strings.Contains(got, `"required flag \"%s\" not set", "body-json"`) {
+		t.Errorf("expected body-json in error message, got:%q", got)
 	}
 }

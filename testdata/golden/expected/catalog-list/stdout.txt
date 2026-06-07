@@ -1,3 +1,6 @@
+ai:
+  elevenlabs           Generate, transform, transcribe, dub, and manage AI audio, voices, music, and conversational agents with ElevenLabs.
+
 auth:
   stytch               Authentication and user management API
 
@@ -41,5 +44,5 @@ social-and-messaging:
   twilio               Communication APIs for SMS, voice, and messaging
 
 travel:
-  google-flights       Flight search via Google Flights. No public API — reached through a community-maintained reverse-engineered wrapper.
+  google-flights       Flight search via Google Flights. No public API — reached through community-maintained reverse-engineered wrappers (krisukox in Go, fli in Python).
 

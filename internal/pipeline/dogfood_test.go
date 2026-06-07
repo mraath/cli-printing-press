@@ -388,6 +388,33 @@ func newOrphanCmd() { cmd := &cobra.Command{Use: "orphan"} }
 	assert.Equal(t, []string{"orphan"}, result.Unregistered)
 }
 
+// TestCheckCommandTree_BacktickUse pins that the constructor walker reads
+// the Use: leaf name from a backtick raw-string literal, which authors reach
+// for when the command name contains a literal double-quote. Without
+// backtick support, useName silently falls back to the constructor name
+// and the command surfaces with the wrong identity in CommandTreeResult.
+func TestCheckCommandTree_BacktickUse(t *testing.T) {
+	dir := t.TempDir()
+	cliDir := filepath.Join(dir, "internal", "cli")
+	require.NoError(t, os.MkdirAll(cliDir, 0o755))
+
+	writeTestFile(t, filepath.Join(cliDir, "root.go"), `package cli
+func newRootCmd() {
+	rootCmd.AddCommand(newQueryCmd())
+}
+`)
+	writeTestFile(t, filepath.Join(cliDir, "query.go"),
+		"package cli\n"+
+			"func newQueryCmd() *cobra.Command {\n"+
+			"\treturn &cobra.Command{Use: `query <project> \"<sql>\"`}\n"+
+			"}\n")
+
+	result := checkCommandTree(dir)
+	assert.Equal(t, 1, result.Defined)
+	assert.Equal(t, 1, result.Registered)
+	assert.Empty(t, result.Unregistered)
+}
+
 func TestCheckCommandTree_DeeplyNested(t *testing.T) {
 	dir := t.TempDir()
 	cliDir := filepath.Join(dir, "internal", "cli")
@@ -1012,6 +1039,36 @@ func newHealthCmd() *cobra.Command {
 	})
 }
 
+// TestCheckNovelFeatures_BacktickUse pins that the walker matches commands
+// declared with Go's backtick raw-string Use: form. Authors reach for
+// backticks when the command name contains a literal double-quote (e.g.,
+// `query <project> "<sql>"`), and the walker must not silently report
+// those as missing.
+func TestCheckNovelFeatures_BacktickUse(t *testing.T) {
+	cliDir := t.TempDir()
+	cliCodeDir := filepath.Join(cliDir, "internal", "cli")
+	require.NoError(t, os.MkdirAll(cliCodeDir, 0o755))
+	writeTestFile(t, filepath.Join(cliCodeDir, "query.go"),
+		"package cli\n"+
+			"func newQueryCmd() *cobra.Command {\n"+
+			"\treturn &cobra.Command{Use: `query <project> \"<sql>\"`}\n"+
+			"}\n")
+
+	researchDir := t.TempDir()
+	research := &ResearchResult{
+		APIName: "test",
+		NovelFeatures: []NovelFeature{
+			{Name: "SQL query", Command: "query"},
+		},
+	}
+	require.NoError(t, writeResearchJSON(research, researchDir))
+
+	result := checkNovelFeatures(cliDir, researchDir)
+	assert.Equal(t, 1, result.Planned)
+	assert.Equal(t, 1, result.Found)
+	assert.Empty(t, result.Missing)
+}
+
 func TestCheckNovelFeatures_ZeroSurvivors(t *testing.T) {
 	// All planned features missing — novel_features_built should be a non-nil
 	// empty slice (not omitted), so the fallback to the aspirational list
@@ -1105,6 +1162,188 @@ func TestCheckNovelFeatures_ZeroSurvivors(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, string(rootData), "Highlights (not in the official API docs):")
 	assert.NotContains(t, string(rootData), "planned health")
+}
+
+// TestCheckNovelFeatures_CrossCutting pins the cross-cutting-feature
+// fallback added in #1197: planned features whose Command is a
+// parenthetical marker ("(any) --dry-run", "(internal client behavior)",
+// "(any read command, default behavior)") are detected against
+// rootFlags / agent-authored internal packages rather than reported as
+// missing. Flag-named features still report missing when the flag isn't
+// declared anywhere in CLI source.
+func TestCheckNovelFeatures_CrossCutting(t *testing.T) {
+	// Helper: minimal CLI fixture with a single command file plus a
+	// root.go that declares a few persistent flags as string literals.
+	// Optional agentPkg adds an agent-authored internal/<name>/<name>.go.
+	setupCLI := func(t *testing.T, agentPkg string) string {
+		t.Helper()
+		cliDir := t.TempDir()
+		cliCodeDir := filepath.Join(cliDir, "internal", "cli")
+		require.NoError(t, os.MkdirAll(cliCodeDir, 0o755))
+		writeTestFile(t, filepath.Join(cliCodeDir, "health.go"),
+			`package cli
+func newHealthCmd() *cobra.Command {
+	return &cobra.Command{Use: "health"}
+}`)
+		writeTestFile(t, filepath.Join(cliCodeDir, "root.go"), strings.Join([]string{
+			`package cli`,
+			``,
+			`func newRootCmd() *cobra.Command {`,
+			`	rootCmd := &cobra.Command{Use: "test-pp-cli"}`,
+			`	rootCmd.PersistentFlags().Bool("dry-run", false, "preview only")`,
+			`	rootCmd.PersistentFlags().String("tier", "", "service tier")`,
+			`	rootCmd.AddCommand(newHealthCmd())`,
+			`	return rootCmd`,
+			`}`,
+			``,
+		}, "\n"))
+		if agentPkg != "" {
+			agentDir := filepath.Join(cliDir, "internal", agentPkg)
+			require.NoError(t, os.MkdirAll(agentDir, 0o755))
+			writeTestFile(t, filepath.Join(agentDir, "request.go"),
+				"package "+agentPkg+"\n\nfunc DoRequest() {}\n")
+		}
+		return cliDir
+	}
+
+	t.Run("global flag declared on rootCmd resolves (any) marker", func(t *testing.T) {
+		cliDir := setupCLI(t, "")
+		researchDir := t.TempDir()
+		require.NoError(t, writeResearchJSON(&ResearchResult{
+			APIName: "test",
+			NovelFeatures: []NovelFeature{
+				{Name: "Dry-run mode", Command: "(any) --dry-run"},
+				{Name: "Service tier", Command: "(any) --tier standard"},
+			},
+		}, researchDir))
+
+		result := checkNovelFeatures(cliDir, researchDir)
+		assert.Equal(t, 2, result.Planned)
+		assert.Equal(t, 2, result.Found)
+		assert.Empty(t, result.Missing)
+	})
+
+	t.Run("undeclared flag reports missing", func(t *testing.T) {
+		cliDir := setupCLI(t, "")
+		researchDir := t.TempDir()
+		require.NoError(t, writeResearchJSON(&ResearchResult{
+			APIName: "test",
+			NovelFeatures: []NovelFeature{
+				{Name: "Bogus flag", Command: "(any) --nonexistent-flag"},
+			},
+		}, researchDir))
+
+		result := checkNovelFeatures(cliDir, researchDir)
+		assert.Equal(t, 0, result.Found)
+		assert.Equal(t, []string{"(any) --nonexistent-flag"}, result.Missing)
+	})
+
+	t.Run("internal marker resolves when an agent-authored package exists", func(t *testing.T) {
+		cliDir := setupCLI(t, "dfs")
+		researchDir := t.TempDir()
+		require.NoError(t, writeResearchJSON(&ResearchResult{
+			APIName: "test",
+			NovelFeatures: []NovelFeature{
+				{Name: "Adaptive client", Command: "(internal client behavior)"},
+				{Name: "Config resolution", Command: "(internal config resolution)"},
+			},
+		}, researchDir))
+
+		result := checkNovelFeatures(cliDir, researchDir)
+		assert.Equal(t, 2, result.Found)
+		assert.Empty(t, result.Missing)
+	})
+
+	t.Run("internal marker reports missing when no agent package exists", func(t *testing.T) {
+		cliDir := setupCLI(t, "")
+		researchDir := t.TempDir()
+		require.NoError(t, writeResearchJSON(&ResearchResult{
+			APIName: "test",
+			NovelFeatures: []NovelFeature{
+				{Name: "Adaptive client", Command: "(internal client behavior)"},
+			},
+		}, researchDir))
+
+		result := checkNovelFeatures(cliDir, researchDir)
+		assert.Equal(t, 0, result.Found)
+		assert.Equal(t, []string{"(internal client behavior)"}, result.Missing)
+	})
+
+	t.Run("any-marker description without flag trusts the planner", func(t *testing.T) {
+		cliDir := setupCLI(t, "")
+		researchDir := t.TempDir()
+		require.NoError(t, writeResearchJSON(&ResearchResult{
+			APIName: "test",
+			NovelFeatures: []NovelFeature{
+				{Name: "Default behavior", Command: "(any read command, default behavior)"},
+			},
+		}, researchDir))
+
+		result := checkNovelFeatures(cliDir, researchDir)
+		assert.Equal(t, 1, result.Found)
+		assert.Empty(t, result.Missing)
+	})
+
+	t.Run("regular commands still reported missing when unbuilt", func(t *testing.T) {
+		// "sql" and "search" don't have command files and don't carry
+		// cross-cutting markers, so they must still appear as missing —
+		// the cross-cutting fallback must not mask genuinely-unbuilt
+		// commands. The "sql --dry-run" variant pins that a real command
+		// verb followed by a globally-declared flag is still reported
+		// missing: the fallback must defer to the regular matcher for
+		// these shapes, not absorb them just because the flag happens to
+		// be quoted in internal/cli/*.go.
+		cliDir := setupCLI(t, "dfs")
+		researchDir := t.TempDir()
+		require.NoError(t, writeResearchJSON(&ResearchResult{
+			APIName: "test",
+			NovelFeatures: []NovelFeature{
+				{Name: "Local SQL", Command: "sql"},
+				{Name: "Local search", Command: "search"},
+				{Name: "SQL dry-run", Command: "sql --dry-run"},
+			},
+		}, researchDir))
+
+		result := checkNovelFeatures(cliDir, researchDir)
+		assert.Equal(t, 0, result.Found)
+		assert.ElementsMatch(t, []string{"sql", "search", "sql --dry-run"}, result.Missing)
+	})
+}
+
+// TestMatchCrossCuttingFeature covers the helper's edge cases directly:
+// non-cross-cutting inputs return applied=false so the regular path
+// matcher gets to decide; flag detection extracts =value suffixes and
+// surrounding punctuation; case-folding is consistent.
+func TestMatchCrossCuttingFeature(t *testing.T) {
+	cliDir := t.TempDir()
+	cliCodeDir := filepath.Join(cliDir, "internal", "cli")
+	require.NoError(t, os.MkdirAll(cliCodeDir, 0o755))
+	writeTestFile(t, filepath.Join(cliCodeDir, "root.go"),
+		"package cli\n\nfunc init() {\n\t_ = \"dry-run\"\n\t_ = \"agent\"\n}\n")
+
+	cases := []struct {
+		name    string
+		cmd     string
+		matched bool
+		applied bool
+	}{
+		{"plain command name yields applied=false", "health", false, false},
+		{"space-separated path yields applied=false", "portfolio perf", false, false},
+		{"command followed by flag yields applied=false", "sql --dry-run", false, false},
+		{"bare flag matches declared name", "--dry-run", true, true},
+		{"flag with =value suffix matches", "--dry-run=true", true, true},
+		{"flag with trailing punctuation matches", "--dry-run,", true, true},
+		{"uppercase paren marker normalizes", "(ANY) --dry-run", true, true},
+		{"undeclared flag reports missing", "(any) --no-such-flag", false, true},
+		{"unknown paren marker yields applied=false", "(observation) something", false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			matched, applied := matchCrossCuttingFeature(tc.cmd, cliDir)
+			assert.Equal(t, tc.applied, applied, "applied")
+			assert.Equal(t, tc.matched, matched, "matched")
+		})
+	}
 }
 
 func captureStderr[T any](t *testing.T, captured *string, fn func() T) T {
@@ -1397,6 +1636,48 @@ func newCmd() *cobra.Command {
 
 	result := checkNamingConsistency(dir)
 	assert.Empty(t, result.Violations, "--yes is allowed; only --skip-confirmations variants are banned")
+}
+
+// TestCheckNamingConsistency_BacktickUse pins that the verb extractor reads
+// the leading identifier from a backtick raw-string Use: declaration. A
+// banned verb hidden in a backtick literal must still surface as a
+// violation; symmetrically, a permitted verb in the same form must not
+// produce a false positive.
+func TestCheckNamingConsistency_BacktickUse(t *testing.T) {
+	t.Run("permitted verb in backtick Use", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, "internal", "cli"), 0o755))
+		writeTestFile(t, filepath.Join(dir, "internal", "cli", "cmd.go"),
+			"package cli\n"+
+				"\n"+
+				"import \"github.com/spf13/cobra\"\n"+
+				"\n"+
+				"func newQueryCmd() *cobra.Command {\n"+
+				"\treturn &cobra.Command{Use: `query <project> \"<sql>\"`}\n"+
+				"}\n")
+
+		result := checkNamingConsistency(dir)
+		assert.Equal(t, 1, result.Checked)
+		assert.Empty(t, result.Violations)
+	})
+
+	t.Run("banned verb in backtick Use", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, "internal", "cli"), 0o755))
+		writeTestFile(t, filepath.Join(dir, "internal", "cli", "cmd.go"),
+			"package cli\n"+
+				"\n"+
+				"import \"github.com/spf13/cobra\"\n"+
+				"\n"+
+				"func newInfoCmd() *cobra.Command {\n"+
+				"\treturn &cobra.Command{Use: `info <project> \"<filter>\"`}\n"+
+				"}\n")
+
+		result := checkNamingConsistency(dir)
+		require.Len(t, result.Violations, 1)
+		assert.Equal(t, "info", result.Violations[0].Banned)
+		assert.Equal(t, "verb", result.Violations[0].Category)
+	})
 }
 
 func TestCheckNamingConsistency_NoFalsePositiveOnIdentifierWithBannedSubstring(t *testing.T) {

@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/mvanhorn/cli-printing-press/v4/internal/naming"
+	"github.com/mvanhorn/cli-printing-press/v4/internal/openapi"
 	apispec "github.com/mvanhorn/cli-printing-press/v4/internal/spec"
 	"gopkg.in/yaml.v3"
 )
@@ -1152,10 +1153,11 @@ func scoreVision(dir string) int {
 	return score
 }
 
-// cobraUseLeafRe extracts the first whitespace-delimited token from a Cobra
-// `Use: "..."` literal — the leaf command name (e.g., `"trajectory <slug>"`
-// → `trajectory`).
-var cobraUseLeafRe = regexp.MustCompile(`Use:\s*"([^"\s]+)`)
+// cobraUseLeafRe extracts the leaf command name from a Cobra Use: literal.
+// Accepts both Go string forms — double-quoted and backtick raw-string —
+// because authors reach for backticks when the value contains a literal
+// double-quote.
+var cobraUseLeafRe = regexp.MustCompile("Use:\\s*[\"`]([^\"`\\s]+)")
 
 // manifestNovelFeatureLeaves returns the leaves of every novel_features[].command
 // in dir/.printing-press.json. Returns nil when the manifest is missing,
@@ -1499,6 +1501,10 @@ type openAPISecurityScheme struct {
 	Scheme     string
 	In         string
 	HeaderName string
+	// Prefix mirrors apispec.AuthConfig.Prefix for internal-YAML specs that
+	// override the literal "Bearer" scheme word (e.g., "Token", "PRIVATE-TOKEN").
+	// Empty for OpenAPI-derived schemes; bearer-branch scoring falls back to "Bearer".
+	Prefix string
 }
 
 const (
@@ -1530,7 +1536,7 @@ func loadOpenAPISpec(specPath string) (*openAPISpecInfo, error) {
 		return nil, nil
 	}
 
-	data, err := os.ReadFile(specPath)
+	data, err := openapi.LoadSpecBytes(specPath, false, false)
 	if err != nil {
 		return nil, fmt.Errorf("reading spec: %w", err)
 	}
@@ -1757,6 +1763,7 @@ func evaluateAuthProtocol(dir string, spec *openAPISpecInfo) dimensionScore {
 		return dimensionScore{scored: true}
 	}
 
+	hasStructuralOAuth := hasStructuralOAuthSurface(dir, configContent)
 	referencedSchemes := referencedSecuritySchemes(spec.SecurityRequirements)
 	totalScore := 0
 	scoredSets := 0
@@ -1768,7 +1775,7 @@ func evaluateAuthProtocol(dir string, spec *openAPISpecInfo) dimensionScore {
 		bestScore := -1
 		scoreable := false
 		for _, alternative := range requirementSet.Alternatives {
-			score, ok := scoreAuthAlternative(clientContent, configContent, authContent, spec.SecuritySchemes, alternative, referencedSchemes)
+			score, ok := scoreAuthAlternative(clientContent, configContent, authContent, hasStructuralOAuth, spec.SecuritySchemes, alternative, referencedSchemes)
 			if !ok {
 				continue
 			}
@@ -1851,7 +1858,7 @@ func referencedSecuritySchemes(requirementSets []securityRequirementSet) map[str
 	return referenced
 }
 
-func scoreAuthAlternative(clientContent, configContent, authContent string, schemes map[string]openAPISecurityScheme, alternative []string, referencedSchemes map[string]bool) (int, bool) {
+func scoreAuthAlternative(clientContent, configContent, authContent string, hasStructuralOAuth bool, schemes map[string]openAPISecurityScheme, alternative []string, referencedSchemes map[string]bool) (int, bool) {
 	if len(alternative) == 0 {
 		return 0, false
 	}
@@ -1871,7 +1878,7 @@ func scoreAuthAlternative(clientContent, configContent, authContent string, sche
 		if composedHeaders && isAPIKeyHeaderScheme(scheme) {
 			score, scoreable = scoreComposedHeaderScheme(clientContent, scheme)
 		} else {
-			score, scoreable = scoreAuthScheme(clientContent, configContent, authContent, scheme)
+			score, scoreable = scoreAuthScheme(clientContent, configContent, authContent, hasStructuralOAuth, scheme)
 		}
 		if !scoreable {
 			continue
@@ -1892,7 +1899,7 @@ func scoreAuthAlternative(clientContent, configContent, authContent string, sche
 	return score, true
 }
 
-func scoreAuthScheme(clientContent, configContent, authContent string, scheme openAPISecurityScheme) (int, bool) {
+func scoreAuthScheme(clientContent, configContent, authContent string, hasStructuralOAuth bool, scheme openAPISecurityScheme) (int, bool) {
 	nameLower := strings.ToLower(scheme.Key)
 	headerName := "Authorization"
 	authHeaderMatched := false
@@ -1900,6 +1907,7 @@ func scoreAuthScheme(clientContent, configContent, authContent string, scheme op
 	queryMatched := false
 	envMatched := false
 	scoreable := false
+	bearerStyle := false
 
 	if strings.EqualFold(scheme.Type, "apikey") && scheme.In == "header" && strings.TrimSpace(scheme.HeaderName) != "" {
 		headerName = scheme.HeaderName
@@ -1913,7 +1921,12 @@ func scoreAuthScheme(clientContent, configContent, authContent string, scheme op
 		}
 	case strings.Contains(nameLower, "bearer") || (scheme.Type == "http" && scheme.Scheme == "bearer"):
 		scoreable = true
-		if authPrefixLiteralPresent("Bearer", clientContent, configContent, authContent) {
+		bearerStyle = true
+		bearerLiteral := scheme.Prefix
+		if strings.TrimSpace(bearerLiteral) == "" {
+			bearerLiteral = "Bearer"
+		}
+		if authPrefixLiteralPresent(bearerLiteral, clientContent, configContent, authContent) {
 			authHeaderMatched = true
 		}
 	case strings.Contains(nameLower, "basic") || (scheme.Type == "http" && scheme.Scheme == "basic"):
@@ -1933,12 +1946,25 @@ func scoreAuthScheme(clientContent, configContent, authContent string, scheme op
 		}
 	case strings.EqualFold(scheme.Type, "oauth2"), strings.EqualFold(scheme.Type, "openidconnect"):
 		scoreable = true
+		bearerStyle = true
 		if authPrefixLiteralPresent("Bearer", clientContent, configContent, authContent) {
 			authHeaderMatched = true
 		}
 	}
 	if !scoreable {
 		return 0, false
+	}
+
+	// Bearer-style schemes (http/bearer, oauth2, openidconnect) are otherwise
+	// scored by grepping for the "Bearer " literal and the spec's scheme key as
+	// an env-var needle, both of which a cosmetic polish pass can fake by adding
+	// an unused const. Real OAuth machinery (refresh-token rotation in config or
+	// a dedicated oauth helper package) credits both signals at once because the
+	// CLI demonstrably exchanges tokens and reads OAuth env vars (CLIENT_ID,
+	// REFRESH_TOKEN) that sanitizeEnvName never matches.
+	if bearerStyle && hasStructuralOAuth {
+		authHeaderMatched = true
+		envMatched = true
 	}
 
 	// AuthProtocol pattern: generated clients use Header.Set/Add with the expected header name.
@@ -2088,6 +2114,22 @@ func scoreComposedHeaderScheme(clientContent string, scheme openAPISecuritySchem
 func headerAssignmentPresent(clientContent, headerName string) bool {
 	return strings.Contains(clientContent, `Header.Set("`+headerName+`"`) ||
 		strings.Contains(clientContent, `Header.Add("`+headerName+`"`)
+}
+
+// refreshTokenFieldRe word-anchors RefreshToken so cosmetic names like
+// NoRefreshToken or RefreshTokenError don't satisfy the structural check.
+var refreshTokenFieldRe = regexp.MustCompile(`\bRefreshToken\b`)
+
+// hasStructuralOAuthSurface returns true when the printed CLI ships real
+// OAuth machinery rather than a literal "Bearer " const that grep can find.
+// Either signal is sufficient — a generated config.go with a RefreshToken
+// rotation field, or a hand-written internal/oauth/ helper package.
+func hasStructuralOAuthSurface(dir, configContent string) bool {
+	if refreshTokenFieldRe.MatchString(configContent) {
+		return true
+	}
+	info, err := os.Stat(filepath.Join(dir, "internal", "oauth"))
+	return err == nil && info.IsDir()
 }
 
 func authPrefixLiteralPresent(prefix string, contents ...string) bool {

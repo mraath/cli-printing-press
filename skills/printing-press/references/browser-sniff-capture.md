@@ -58,8 +58,13 @@ When a proxy pattern is detected:
 Check which browser automation tools are available:
 
 ```bash
-# Prefer browser-use (CLI-driven, Performance API collection)
-if command -v browser-use >/dev/null 2>&1 || uvx browser-use --help >/dev/null 2>&1; then
+# Prefer browser-use (CLI-driven, Performance API collection).
+# Use `command -v` only. Do NOT use `uvx browser-use --help` as a fallback
+# probe: when uvx exists but browser-use doesn't, that command silently
+# downloads and caches the package, which is an unconsented install.
+# The capture commands below invoke `browser-use` directly (not via uvx),
+# so a uvx-cache-only state would lie to the detection.
+if command -v browser-use >/dev/null 2>&1; then
   SNIFF_BACKEND="browser-use"
 # Fall back to agent-browser only if it can provide equivalent network capture artifacts.
 elif command -v agent-browser >/dev/null 2>&1; then
@@ -92,7 +97,9 @@ If either MCP flag is true, extend the status report:
 
 > "Using **<tool>** for traffic capture. Fallbacks available: chrome-MCP, computer-use." (list whichever flags are true)
 
-#### Step 1b: Install capture tool (if none found)
+#### Step 1b: Install capture tool (fallback — preflight should have prompted first)
+
+Preflight (`references/setup-checks.md` section 5) offers to install browser-use and agent-browser on every run, so most users arrive at Step 1 with one or both already installed. This step is a fallback for the case where the user declined the preflight prompt and the current run actually needs a browser backend.
 
 If neither tool is installed, offer to install via `AskUserQuestion`. Do not install automatically:
 
@@ -106,9 +113,12 @@ If neither tool is installed, offer to install via `AskUserQuestion`. Do not ins
 **If user picks browser-use:**
 
 ```bash
-# Detect Python package manager
+# Detect Python package manager. Use `uv tool install` (not `uv pip install`):
+# `uv pip install` targets the active venv and won't put the binary in PATH
+# outside it; `uv tool install` creates an isolated env and symlinks the
+# entry-point into `~/.local/bin`.
 if command -v uv >/dev/null 2>&1; then
-  uv pip install browser-use
+  uv tool install browser-use
 elif command -v pip >/dev/null 2>&1; then
   pip install browser-use
 else
@@ -213,14 +223,16 @@ For option 1 (save-then-restore):
 **IMPORTANT:** `--auto-connect`, `--state`, `--profile`, and `--headed` are daemon launch options in agent-browser. They only take effect when starting a new daemon. You MUST close the daemon between save and load.
 
 ```bash
-# Grab cookies from running Chrome
-agent-browser --auto-connect state save "$DISCOVERY_DIR/session-state.json" 2>&1
+# Grab cookies from running Chrome. $SESSION_STATE_FILE lives outside
+# $DISCOVERY_DIR (initialized in SKILL.md's "Run Initialization") so the
+# Phase 5.5 `cp -r "$DISCOVERY_DIR"` cannot pick it up.
+agent-browser --auto-connect state save "$SESSION_STATE_FILE" 2>&1
 
 # Close the auto-connect daemon so --state can start a fresh one
 agent-browser close 2>&1
 
 # Start a new headless daemon with the saved auth state
-agent-browser --state "$DISCOVERY_DIR/session-state.json" open <url>
+agent-browser --state "$SESSION_STATE_FILE" open <url>
 ```
 If auto-connect fails (no debug port), explain: "Chrome doesn't have remote debugging enabled. Quit Chrome and relaunch with `--remote-debugging-port=9222`, or pick option 2."
 
@@ -268,7 +280,7 @@ browser-use open <login-url> --headed --session "<api>-auth"
 Instruct the user: "A browser window is open. Please log in to `<site>`. Let me know when you're done."
 After login, save state:
 ```bash
-agent-browser state save "$DISCOVERY_DIR/session-state.json"
+agent-browser state save "$SESSION_STATE_FILE"
 ```
 Close the headed browser and restart headless with the saved state.
 
@@ -333,7 +345,7 @@ If the result is `SESSION_EXPIRED` (login link visible, no account link), the pr
 
 Do NOT silently proceed without auth when the session has expired. The authenticated surface is often the most valuable part of the API (order history, rewards, saved data).
 
-If cookies are verified, proceed to Steps 2a/2b capture flow with the authenticated session loaded. The session state file is stored at `$DISCOVERY_DIR/session-state.json`.
+If cookies are verified, proceed to Steps 2a/2b capture flow with the authenticated session loaded. The session state file is stored at `$SESSION_STATE_FILE` (under `${TMPDIR:-/tmp}/printing-press-$(id -u)/session/$RUN_ID/`, outside `$DISCOVERY_DIR`, so it cannot reach archived manuscripts).
 
 #### Step 2a.0: Direct-API-probe fallback (try before browser-use when WAF-protected)
 

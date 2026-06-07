@@ -12,32 +12,32 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"github.com/spf13/cobra"
 	"printing-press-golden-pp-cli/internal/client"
 	"printing-press-golden-pp-cli/internal/config"
-	"github.com/spf13/cobra"
 )
 
 var version = "1.0.0"
 
 type rootFlags struct {
-	asJSON       bool
-	compact      bool
-	csv          bool
-	plain        bool
-	quiet        bool
-	dryRun       bool
-	noCache      bool
-	noInput      bool
-	idempotent   bool
-	yes          bool
-	agent        bool
-	selectFields string
-	configPath   string
-	profileName  string
-	deliverSpec  string
-	timeout      time.Duration
-	rateLimit    float64
-	dataSource   string
+	asJSON        bool
+	compact       bool
+	csv           bool
+	plain         bool
+	quiet         bool
+	dryRun        bool
+	noCache       bool
+	noInput       bool
+	idempotent    bool
+	yes           bool
+	agent         bool
+	selectFields  string
+	configPath    string
+	profileName   string
+	deliverSpec   string
+	timeout       time.Duration
+	rateLimit     float64
+	dataSource    string
 	freshnessMeta any
 
 	// deliverBuf captures command output when --deliver is set to a
@@ -65,7 +65,14 @@ func Execute() error {
 		if idx := strings.Index(msg, "unknown flag: "); idx >= 0 {
 			flagStr := strings.TrimSpace(msg[idx+len("unknown flag: "):])
 			if suggestion := suggestFlag(flagStr, rootCmd); suggestion != "" {
-				return fmt.Errorf("%w\nhint: did you mean --%s?", err, suggestion)
+				// Cobra already printed `Error: unknown flag: --foob` before
+				// returning; the wrap below attaches the hint to err.Error()
+				// for downstream consumers and exit-code classification, but
+				// would never reach stderr now that main.go no longer prints
+				// err. Emit the hint explicitly so the suggestion still
+				// shows up under Cobra's error line.
+				fmt.Fprintf(os.Stderr, "hint: did you mean --%s?\n", suggestion)
+				err = fmt.Errorf("%w\nhint: did you mean --%s?", err, suggestion)
 			}
 		}
 	}
@@ -75,7 +82,48 @@ func Execute() error {
 			return derr
 		}
 	}
+	if err != nil && isCobraUsageError(err) {
+		// Cobra/pflag pre-RunE errors (unknown flag, unknown command,
+		// missing required, etc.) never flow through usageErr() because
+		// they originate inside rootCmd.Execute() before any user RunE
+		// runs. Without this wrap, ExitCode() falls through to the
+		// default and emits 1 — clobbering the conventional code-2 for
+		// usage errors that the helpers.go contract already promises.
+		return usageErr(err)
+	}
 	return err
+}
+
+// isCobraUsageError reports whether err matches one of Cobra/pflag's
+// pre-RunE usage-error shapes. Detection is by message prefix to match
+// the same approach the unknown-flag hint path uses above; neither
+// Cobra nor pflag exports typed sentinels for these.
+//
+// Patterns are anchored to the literal punctuation Cobra and pflag
+// emit so an application's own RunE error that happens to contain the
+// substring "required flag" or "invalid argument" doesn't get
+// misclassified as a usage error.
+//
+// Patterns covered (Cobra v1.x + pflag v1.x as of 2026-05):
+//   - "unknown flag: --foo"                            (pflag)
+//   - "unknown shorthand flag: 'x' in -x"              (pflag)
+//   - "unknown command \"foo\" for ..."                (Cobra)
+//   - "required flag(s) \"foo\" not set"               (Cobra MarkFlagRequired)
+//   - "flag needs an argument: --foo"                  (pflag, missing value)
+//   - "invalid argument \"x\" for \"--y\" flag: ..."   (pflag, parse failure)
+//
+// Returns false for nil err.
+func isCobraUsageError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.HasPrefix(msg, "unknown flag") ||
+		strings.HasPrefix(msg, "unknown shorthand flag") ||
+		strings.HasPrefix(msg, "unknown command") ||
+		strings.HasPrefix(msg, `required flag(s) "`) ||
+		strings.HasPrefix(msg, "flag needs an argument:") ||
+		strings.HasPrefix(msg, `invalid argument "`)
 }
 
 func newRootCmd(flags *rootFlags) *cobra.Command {

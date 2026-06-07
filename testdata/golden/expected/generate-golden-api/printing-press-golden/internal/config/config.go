@@ -14,17 +14,17 @@ import (
 )
 
 type Config struct {
-	BaseURL        string `toml:"base_url"`
-	AuthHeaderVal  string `toml:"auth_header"`
-	Headers        map[string]string `toml:"headers,omitempty"`
-	AuthSource     string `toml:"-"`
-	AccessToken    string `toml:"access_token"`
-	RefreshToken   string `toml:"refresh_token"`
-	TokenExpiry    time.Time `toml:"token_expiry"`
-	ClientID       string `toml:"client_id"`
-	ClientSecret   string `toml:"client_secret"`
-	Path           string `toml:"-"`
-	PrintingPressGoldenApiKey string `toml:"press_golden_api_key"`
+	BaseURL                   string            `toml:"base_url"`
+	AuthHeaderVal             string            `toml:"auth_header"`
+	Headers                   map[string]string `toml:"headers,omitempty"`
+	AuthSource                string            `toml:"-"`
+	AccessToken               string            `toml:"access_token"`
+	RefreshToken              string            `toml:"refresh_token"`
+	TokenExpiry               time.Time         `toml:"token_expiry"`
+	ClientID                  string            `toml:"client_id"`
+	ClientSecret              string            `toml:"client_secret"`
+	Path                      string            `toml:"-"`
+	PrintingPressGoldenApiKey string            `toml:"press_golden_api_key"`
 }
 
 func Load(configPath string) (*Config, error) {
@@ -131,9 +131,19 @@ func (c *Config) SaveCredential(token string) error {
 }
 
 func (c *Config) ClearTokens() error {
+	// AuthHeader() falls back to the env-var-derived fields when AuthHeaderVal
+	// and AccessToken are empty, so dropping the working credential requires
+	// zeroing every emitted credential field, not just the OAuth trio.
+	// ClientID/ClientSecret persist to disk via SaveTokens for the oauth2
+	// and oauth2-cc flows, so logout must wipe them too; otherwise
+	// `auth login` can re-mint a new access token unattended.
+	c.AuthHeaderVal = ""
 	c.AccessToken = ""
 	c.RefreshToken = ""
 	c.TokenExpiry = time.Time{}
+	c.ClientID = ""
+	c.ClientSecret = ""
+	c.PrintingPressGoldenApiKey = ""
 	return c.save()
 }
 

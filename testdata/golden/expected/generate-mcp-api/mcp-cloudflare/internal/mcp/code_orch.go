@@ -53,13 +53,13 @@ func RegisterCodeOrchestrationTools(s *server.MCPServer) {
 // lowercase stream of description + path tokens used for naive ranking;
 // anything more sophisticated belongs on the agent side.
 type codeOrchEndpoint struct {
-	ID          string
-	Method      string
-	Path        string
-	Tier        string
-	Summary     string
-	Positional  []string
-	keywords    []string
+	ID         string
+	Method     string
+	Path       string
+	Tier       string
+	Summary    string
+	Positional []string
+	keywords   []string
 }
 
 // codeOrchEndpoints is the generator-populated registry covering every
@@ -67,12 +67,12 @@ type codeOrchEndpoint struct {
 // via <api>_search, so hierarchy shows up as dotted IDs, not nested maps.
 var codeOrchEndpoints = []codeOrchEndpoint{
 	{
-		ID:      "items.list",
-		Method:  "GET",
-		Path:    "/items",
-		Summary: "List items",
-		Positional: []string{ },
-		keywords: codeOrchKeywords("items", "list", "List items", "/items"),
+		ID:         "items.list",
+		Method:     "GET",
+		Path:       "/items",
+		Summary:    "List items",
+		Positional: []string{},
+		keywords:   codeOrchKeywords("items", "list", "List items", "/items"),
 	},
 }
 
@@ -202,6 +202,10 @@ func handleCodeOrchExecute(ctx context.Context, req mcplib.CallToolRequest) (*mc
 		}
 	}
 
+	// Code-orch dispatch has no schema metadata at runtime to bucket params
+	// into body vs query, so POST/PUT/PATCH keep the everything-to-body
+	// design. DELETE is the one verb where query routing is unambiguous; the
+	// previous code built `query` but never passed it.
 	query := map[string]string{}
 	if ep.Method == "GET" || ep.Method == "DELETE" {
 		for k, v := range params {
@@ -214,7 +218,7 @@ func handleCodeOrchExecute(ctx context.Context, req mcplib.CallToolRequest) (*mc
 	case "GET":
 		data, err = c.Get(path, query)
 	case "DELETE":
-		data, _, err = c.Delete(path)
+		data, _, err = c.DeleteWithParams(path, query)
 	default:
 		body, mErr := json.Marshal(params)
 		if mErr != nil {

@@ -18,17 +18,17 @@ func newProjectsTasksListProjectCmd(flags *rootFlags) *cobra.Command {
 	var flagAll bool
 
 	cmd := &cobra.Command{
-		Use:   "list-project <projectId>",
-		Aliases: []string{"get"},
-		Short: "List project tasks",
-		Example: "  printing-press-golden-pp-cli projects tasks list-project 550e8400-e29b-41d4-a716-446655440000",
+		Use:         "list-project <projectId>",
+		Aliases:     []string{"get"},
+		Short:       "List project tasks",
+		Example:     "  printing-press-golden-pp-cli projects tasks list-project 550e8400-e29b-41d4-a716-446655440000",
 		Annotations: map[string]string{"pp:endpoint": "tasks.list-project", "pp:method": "GET", "pp:path": "/projects/{projectId}/tasks", "mcp:read-only": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if len(args) == 0 {
 				return cmd.Help()
 			}
 			if cmd.Flags().Changed("priority") {
-				allowedPriority := []string{ "low", "normal", "high" }
+				allowedPriority := []string{"low", "normal", "high"}
 				validPriority := false
 				for _, v := range allowedPriority {
 					if flagPriority == v {
@@ -49,14 +49,18 @@ func newProjectsTasksListProjectCmd(flags *rootFlags) *cobra.Command {
 			path = replacePathParam(path, "projectId", args[0])
 			data, prov, err := resolvePaginatedRead(cmd.Context(), c, flags, "tasks", path, map[string]string{
 				"priority": fmt.Sprintf("%v", flagPriority),
-				"limit": fmt.Sprintf("%v", flagLimit),
-				"cursor": fmt.Sprintf("%v", flagCursor),
+				"limit":    fmt.Sprintf("%v", flagLimit),
+				"cursor":   fmt.Sprintf("%v", flagCursor),
 			}, nil, flagAll, "cursor", "", "")
 			if err != nil {
 				return classifyAPIError(err, flags)
 			}
-			// Print provenance to stderr for human-facing output
-			{
+			// Print provenance to stderr for human-facing output only.
+			// Machine-format flags (--json, --csv, --compact, --quiet, --plain,
+			// --select) and piped stdout suppress this line; the JSON envelope
+			// already carries meta.source for those consumers.
+			// SYNC: keep this gate aligned with command_promoted.go.tmpl.
+			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var countItems []json.RawMessage
 				_ = json.Unmarshal(data, &countItems)
 				printProvenance(cmd, len(countItems), prov)

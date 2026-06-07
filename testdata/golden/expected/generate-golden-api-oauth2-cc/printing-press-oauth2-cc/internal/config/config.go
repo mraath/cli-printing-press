@@ -14,20 +14,20 @@ import (
 )
 
 type Config struct {
-	BaseURL        string `toml:"base_url"`
-	AuthHeaderVal  string `toml:"auth_header"`
-	Headers        map[string]string `toml:"headers,omitempty"`
-	AuthSource     string `toml:"-"`
-	AccessToken    string `toml:"access_token"`
-	RefreshToken   string `toml:"refresh_token"`
-	TokenExpiry    time.Time `toml:"token_expiry"`
-	ClientID       string `toml:"client_id"`
-	ClientSecret   string `toml:"client_secret"`
+	BaseURL       string            `toml:"base_url"`
+	AuthHeaderVal string            `toml:"auth_header"`
+	Headers       map[string]string `toml:"headers,omitempty"`
+	AuthSource    string            `toml:"-"`
+	AccessToken   string            `toml:"access_token"`
+	RefreshToken  string            `toml:"refresh_token"`
+	TokenExpiry   time.Time         `toml:"token_expiry"`
+	ClientID      string            `toml:"client_id"`
+	ClientSecret  string            `toml:"client_secret"`
 	// TokenURL overrides the spec-baked OAuth2 token endpoint. Same fallback
 	// pattern as AuthorizationURL.
-	TokenURL       string `toml:"token_url,omitempty"`
-	Path           string `toml:"-"`
-	PrintingPressOauth2ClientId string `toml:"press_oauth2_client_id"`
+	TokenURL                        string `toml:"token_url,omitempty"`
+	Path                            string `toml:"-"`
+	PrintingPressOauth2ClientId     string `toml:"press_oauth2_client_id"`
 	PrintingPressOauth2ClientSecret string `toml:"press_oauth2_client_secret"`
 }
 
@@ -132,9 +132,20 @@ func (c *Config) SaveTokens(clientID, clientSecret, accessToken, refreshToken st
 }
 
 func (c *Config) ClearTokens() error {
+	// AuthHeader() falls back to the env-var-derived fields when AuthHeaderVal
+	// and AccessToken are empty, so dropping the working credential requires
+	// zeroing every emitted credential field, not just the OAuth trio.
+	// ClientID/ClientSecret persist to disk via SaveTokens for the oauth2
+	// and oauth2-cc flows, so logout must wipe them too; otherwise
+	// `auth login` can re-mint a new access token unattended.
+	c.AuthHeaderVal = ""
 	c.AccessToken = ""
 	c.RefreshToken = ""
 	c.TokenExpiry = time.Time{}
+	c.ClientID = ""
+	c.ClientSecret = ""
+	c.PrintingPressOauth2ClientId = ""
+	c.PrintingPressOauth2ClientSecret = ""
 	return c.save()
 }
 

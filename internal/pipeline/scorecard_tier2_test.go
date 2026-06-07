@@ -2,6 +2,8 @@ package pipeline
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +11,38 @@ import (
 
 	"github.com/stretchr/testify/assert"
 )
+
+// TestLoadOpenAPISpec_AcceptsHTTPURL is the regression guard for #1001:
+// scorer subcommands rejected --spec URLs because the loader called
+// os.ReadFile directly. The fix routes through openapi.LoadSpecBytes,
+// which dispatches by scheme. A URL must now load successfully on every
+// platform without a separate "curl to /tmp" workaround.
+func TestLoadOpenAPISpec_AcceptsHTTPURL(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{
+  "openapi": "3.0.0",
+  "info": {"title": "Demo", "version": "1.0"},
+  "paths": {
+    "/things": {"get": {"responses": {"200": {"description": "ok"}}}}
+  },
+  "components": {
+    "securitySchemes": {
+      "bearer_auth": {"type": "http", "scheme": "bearer"}
+    }
+  }
+}`))
+	}))
+	defer srv.Close()
+
+	info, err := loadOpenAPISpec(srv.URL)
+	assert.NoError(t, err)
+	assert.NotNil(t, info)
+	assert.Contains(t, info.Paths, "/things")
+	assert.Contains(t, info.SecuritySchemes, "bearer_auth")
+}
 
 func TestIsThinMCPDescription(t *testing.T) {
 	tests := []struct {
@@ -2338,4 +2372,122 @@ func writeScorecardFixture(t *testing.T, root, relPath, content string) {
 	if err != nil {
 		t.Fatalf("write %s: %v", relPath, err)
 	}
+}
+
+// TestScoreAuthScheme_BearerPrefixOverride pins that the AuthProtocol scorer
+// accepts a non-Bearer scheme literal when openAPISecurityScheme.Prefix is
+// populated by an internal-YAML spec. The relative comparison (with-Prefix
+// scores higher than without) survives weight rebalancing where an absolute
+// threshold would not.
+func TestScoreAuthScheme_BearerPrefixOverride(t *testing.T) {
+	configWithToken := `func (c *Config) AuthHeader() string { return "Token " + c.AccessToken }`
+	clientStub := `req.Header.Set("Authorization", c.AuthHeader())`
+
+	withPrefix := openAPISecurityScheme{
+		Key:    "bearer_token",
+		Type:   "http",
+		Scheme: "bearer",
+		Prefix: "Token",
+	}
+	withoutPrefix := withPrefix
+	withoutPrefix.Prefix = ""
+
+	scoreWith, _ := scoreAuthScheme(clientStub, configWithToken, "", false, withPrefix)
+	scoreWithout, _ := scoreAuthScheme(clientStub, configWithToken, "", false, withoutPrefix)
+
+	assert.Greater(t, scoreWith, scoreWithout,
+		"AuthProtocol score with configured prefix must exceed the empty-prefix default when generated code uses the prefix literal")
+}
+
+// TestScoreAuthScheme_StructuralOAuthSurface pins that bearer-style schemes
+// get credit for real OAuth machinery (refresh-token rotation in config, or a
+// dedicated internal/oauth helper package) even when the literal "Bearer "
+// string is absent from source — preventing the score-by-literal regression
+// where a polish pass could add an unused const to lift the score.
+func TestScoreAuthScheme_StructuralOAuthSurface(t *testing.T) {
+	bearerScheme := openAPISecurityScheme{Key: "bearerAuth", Type: "http", Scheme: "bearer"}
+	oauth2Scheme := openAPISecurityScheme{Key: "oauth2Auth", Type: "oauth2"}
+	openIDScheme := openAPISecurityScheme{Key: "oidcAuth", Type: "openidconnect"}
+	basicScheme := openAPISecurityScheme{Key: "basicAuth", Type: "http", Scheme: "basic"}
+
+	clientHeaderOnly := `req.Header.Set("Authorization", token)`
+	configRefresh := `type Config struct { AccessToken string; RefreshToken string }`
+	configNoOAuth := `type Config struct { Token string }`
+
+	t.Run("bearer scheme without literal credited when RefreshToken in config", func(t *testing.T) {
+		score, scoreable := scoreAuthScheme(clientHeaderOnly, configRefresh, "", true, bearerScheme)
+		assert.True(t, scoreable)
+		assert.GreaterOrEqual(t, score, 9, "real OAuth surface should lift score above the literal-grep ceiling")
+	})
+
+	t.Run("bearer scheme without literal stays low when no structural OAuth", func(t *testing.T) {
+		score, scoreable := scoreAuthScheme(clientHeaderOnly, configNoOAuth, "", false, bearerScheme)
+		assert.True(t, scoreable)
+		assert.Less(t, score, 7, "absent literal AND absent OAuth surface must not score as wired auth")
+	})
+
+	t.Run("oauth2 scheme without literal credited when structural OAuth present", func(t *testing.T) {
+		score, scoreable := scoreAuthScheme(clientHeaderOnly, configRefresh, "", true, oauth2Scheme)
+		assert.True(t, scoreable)
+		assert.GreaterOrEqual(t, score, 9)
+	})
+
+	t.Run("openidconnect scheme shares the bearer-style credit path", func(t *testing.T) {
+		// openidconnect lives on the same switch case as oauth2, so a future
+		// split must not silently drop structural credit from this arm.
+		score, scoreable := scoreAuthScheme(clientHeaderOnly, configRefresh, "", true, openIDScheme)
+		assert.True(t, scoreable)
+		assert.GreaterOrEqual(t, score, 9)
+	})
+
+	t.Run("basic scheme not lifted by OAuth surface", func(t *testing.T) {
+		// Counter-check: structural OAuth signal must not bleed into non-bearer
+		// schemes. A Basic scheme without its literal should stay at the
+		// header-name credit ceiling regardless of nearby OAuth machinery.
+		withOAuth, _ := scoreAuthScheme(clientHeaderOnly, configRefresh, "", true, basicScheme)
+		withoutOAuth, _ := scoreAuthScheme(clientHeaderOnly, configRefresh, "", false, basicScheme)
+		assert.Equal(t, withOAuth, withoutOAuth, "OAuth surface must not credit basic-scheme scoring")
+	})
+}
+
+// TestHasStructuralOAuthSurface pins the helper's recognition signals:
+// either a RefreshToken field in generated config.go, or a hand-written
+// internal/oauth helper package on disk.
+func TestHasStructuralOAuthSurface(t *testing.T) {
+	t.Run("refresh-token field in config", func(t *testing.T) {
+		dir := t.TempDir()
+		got := hasStructuralOAuthSurface(dir, "type Config struct { RefreshToken string }")
+		assert.True(t, got)
+	})
+
+	t.Run("internal/oauth package on disk", func(t *testing.T) {
+		dir := t.TempDir()
+		err := os.MkdirAll(filepath.Join(dir, "internal", "oauth"), 0o755)
+		assert.NoError(t, err)
+		assert.True(t, hasStructuralOAuthSurface(dir, "type Config struct { Token string }"))
+	})
+
+	t.Run("neither signal present", func(t *testing.T) {
+		dir := t.TempDir()
+		assert.False(t, hasStructuralOAuthSurface(dir, "type Config struct { Token string }"))
+	})
+
+	t.Run("internal/oauth as a regular file does not count", func(t *testing.T) {
+		dir := t.TempDir()
+		err := os.MkdirAll(filepath.Join(dir, "internal"), 0o755)
+		assert.NoError(t, err)
+		err = os.WriteFile(filepath.Join(dir, "internal", "oauth"), []byte("not a package"), 0o644)
+		assert.NoError(t, err)
+		assert.False(t, hasStructuralOAuthSurface(dir, "type Config struct { Token string }"))
+	})
+
+	t.Run("word-anchored RefreshToken rejects same-word neighbours", func(t *testing.T) {
+		// Cosmetic identifiers that contain "RefreshToken" as a substring
+		// (NoRefreshToken, RefreshTokenError) must not trip the structural
+		// check — otherwise the polish pass this fix defeats just renames
+		// its decoy.
+		dir := t.TempDir()
+		assert.False(t, hasStructuralOAuthSurface(dir, "type Config struct { NoRefreshToken bool }"))
+		assert.False(t, hasStructuralOAuthSurface(dir, "type RefreshTokenError struct{}"))
+	})
 }

@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/spf13/cobra"
 	"printing-press-oauth2-pp-cli/internal/cliutil"
 	"printing-press-oauth2-pp-cli/internal/config"
-	"github.com/spf13/cobra"
 )
 
 // OAuth2 client_credentials grant: 2-legged server-to-server flow.
@@ -26,6 +26,7 @@ func newAuthCmd(flags *rootFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "auth",
 		Short: "Manage authentication for Printing Press Oauth2",
+		RunE:  parentNoSubcommandRunE(flags),
 	}
 
 	cmd.AddCommand(newAuthLoginCmd(flags))

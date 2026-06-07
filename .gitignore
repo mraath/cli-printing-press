@@ -5,7 +5,7 @@ catalog/specs/*.graphql
 .cache/
 .gotmp/
 .omx/
-.claude/worktrees/
+.claude/
 /refactor/artifacts/
 /tests/artifacts/perf/
 /printing-press
@@ -13,4 +13,6 @@ library/
 dist/
 claude-upgrade-progress.json
 
-.claude/
+# Local AI agent instructions (not for sharing)
+CLAUDE.local.md
+AGENTS.override.md

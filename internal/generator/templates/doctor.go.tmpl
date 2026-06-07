@@ -429,7 +429,20 @@ func newDoctorCmd(flags *rootFlags) *cobra.Command {
 {{- range .RequiredHeaders}}
 						authHeaders["{{.Name}}"] = "{{.Value}}"
 {{- end}}
-{{- if and (not .UsesBrowserManagedUserAgent) (not (.HasRequiredHeader "User-Agent"))}}
+{{- /*
+	Emit the hardcoded User-Agent fallback only when no other code path has
+	already populated authHeaders["User-Agent"]. Three cases skip the fallback:
+	  1. UsesBrowserManagedUserAgent — the browser transport sets the UA.
+	  2. HasRequiredHeader "User-Agent" — the RequiredHeaders range above set it.
+	  3. Auth.In is "header" (or empty default) AND Auth.Header is "User-Agent" —
+	     the API uses the User-Agent header itself as the auth credential
+	     (NWS-style), so the "authHeaders[Auth.Header] = authHeader" line above
+	     already set it to the configured value. The hardcoded fallback would
+	     overwrite the operator's configured UA and make the credential probe
+	     test the wrong identity.
+*/}}
+{{- $authUsesUA := and .Auth (or (eq .Auth.In "") (eq .Auth.In "header")) (eq (lower .Auth.Header) "user-agent")}}
+{{- if and (not .UsesBrowserManagedUserAgent) (not (.HasRequiredHeader "User-Agent")) (not $authUsesUA)}}
 						authHeaders["User-Agent"] = "{{.Name}}-pp-cli"
 {{- end}}
 						_, authErr := c.GetWithHeaders(verifyPath, authParams, authHeaders)
@@ -439,8 +452,10 @@ func newDoctorCmd(flags *rootFlags) *cobra.Command {
 							report["credentials"] = "valid"
 						case errors.As(authErr, &authAPIErr):
 							switch {
-							case authAPIErr.StatusCode == 401 || authAPIErr.StatusCode == 403:
+							case authAPIErr.StatusCode == 401:
 								report["credentials"] = fmt.Sprintf("invalid (HTTP %d) — check your credentials", authAPIErr.StatusCode)
+							case authAPIErr.StatusCode == 403:
+								report["credentials"] = fmt.Sprintf("scope-limited (HTTP %d) — credentials are valid but lack permission for this endpoint. Check your dashboard's API key scope.", authAPIErr.StatusCode)
 							default:
 								// Non-auth HTTP error (404, 500, etc.) — don't blame credentials
 								report["credentials"] = fmt.Sprintf("ok (HTTP %d from %s, but auth was accepted)", authAPIErr.StatusCode, verifyPath)
@@ -502,6 +517,8 @@ func newDoctorCmd(flags *rootFlags) *cobra.Command {
 				case strings.HasPrefix(s, "optional"):
 					// Optional-auth CLI with no key set — informational, not a failure.
 					indicator = yellow("INFO")
+				case strings.Contains(s, "scope-limited"):
+					indicator = yellow("WARN")
 				case strings.Contains(s, "error") || strings.Contains(s, "not configured") || strings.Contains(s, "unreachable") || strings.Contains(s, "invalid") || strings.Contains(s, "missing"):
 					indicator = red("FAIL")
 				case s == "not required":

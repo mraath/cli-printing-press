@@ -19,9 +19,9 @@ func newProjectsCreateCmd(flags *rootFlags) *cobra.Command {
 	var stdinBody bool
 
 	cmd := &cobra.Command{
-		Use:   "create",
-		Short: "Create project",
-		Example: "  printing-press-golden-pp-cli projects create --name example-resource",
+		Use:         "create",
+		Short:       "Create project",
+		Example:     "  printing-press-golden-pp-cli projects create --name example-resource",
 		Annotations: map[string]string{"pp:endpoint": "projects.create", "pp:method": "POST", "pp:path": "/projects"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !stdinBody {
@@ -38,6 +38,7 @@ func newProjectsCreateCmd(flags *rootFlags) *cobra.Command {
 			}
 
 			path := "/projects"
+			params := map[string]string{}
 			var body map[string]any
 			if stdinBody {
 				stdinData, err := io.ReadAll(os.Stdin)
@@ -61,7 +62,7 @@ func newProjectsCreateCmd(flags *rootFlags) *cobra.Command {
 					body["visibility"] = bodyVisibility
 				}
 			}
-			data, statusCode, err := c.Post(path, body)
+			data, statusCode, err := c.PostWithParams(path, params, body)
 			if err != nil {
 				return classifyAPIError(err, flags)
 			}
@@ -75,7 +76,9 @@ func newProjectsCreateCmd(flags *rootFlags) *cobra.Command {
 						return nil
 					}
 				} else {
-					var wrapped struct{ Data []map[string]any `json:"data"` }
+					var wrapped struct {
+						Data []map[string]any `json:"data"`
+					}
 					if json.Unmarshal(data, &wrapped) == nil && len(wrapped.Data) > 0 {
 						if err := printAutoTable(cmd.OutOrStdout(), wrapped.Data); err != nil {
 							fmt.Fprintf(os.Stderr, "warning: table rendering failed, falling back to JSON: %v\n", err)

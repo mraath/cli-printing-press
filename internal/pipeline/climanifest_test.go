@@ -596,7 +596,7 @@ func TestWriteManifestForGenerateStampsRunID(t *testing.T) {
 	assert.Equal(t, "20260504-190931", got.RunID)
 }
 
-func TestWriteManifestForGenerateOmitsEmptyRunID(t *testing.T) {
+func TestWriteManifestForGenerateAutoFillsEmptyRunID(t *testing.T) {
 	dir := t.TempDir()
 
 	err := WriteManifestForGenerate(GenerateManifestParams{
@@ -607,8 +607,12 @@ func TestWriteManifestForGenerateOmitsEmptyRunID(t *testing.T) {
 
 	data, err := os.ReadFile(filepath.Join(dir, CLIManifestFilename))
 	require.NoError(t, err)
-	// run_id has the omitempty tag; empty value must not appear in serialized JSON.
-	assert.NotContains(t, string(data), `"run_id"`)
+	// publish-validate requires run_id to be non-empty. When the caller has no
+	// research-dir-derived run_id, the emitter falls back to a fresh
+	// YYYYMMDD-HHMMSS so the manifest contract still holds.
+	var got CLIManifest
+	require.NoError(t, json.Unmarshal(data, &got))
+	assert.Regexp(t, `^\d{8}-\d{6}$`, got.RunID)
 }
 
 func TestDeriveRunIDFromResearchDir(t *testing.T) {
@@ -631,6 +635,56 @@ func TestDeriveRunIDFromResearchDir(t *testing.T) {
 			assert.Equal(t, tc.expected, DeriveRunIDFromResearchDir(tc.input))
 		})
 	}
+}
+
+func TestLoadAPINameFromResearchDir(t *testing.T) {
+	t.Parallel()
+
+	t.Run("returns api_name when state.json present", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(
+			filepath.Join(dir, "state.json"),
+			[]byte(`{"api_name":"canvas","run_id":"20260514-070718"}`),
+			0o644,
+		))
+		assert.Equal(t, "canvas", LoadAPINameFromResearchDir(dir))
+	})
+
+	t.Run("trims whitespace from api_name", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(
+			filepath.Join(dir, "state.json"),
+			[]byte(`{"api_name":"  canvas  "}`),
+			0o644,
+		))
+		assert.Equal(t, "canvas", LoadAPINameFromResearchDir(dir))
+	})
+
+	t.Run("empty string when researchDir empty", func(t *testing.T) {
+		t.Parallel()
+		assert.Equal(t, "", LoadAPINameFromResearchDir(""))
+	})
+
+	t.Run("empty string when state.json absent", func(t *testing.T) {
+		t.Parallel()
+		assert.Equal(t, "", LoadAPINameFromResearchDir(t.TempDir()))
+	})
+
+	t.Run("empty string when state.json malformed", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "state.json"), []byte(`not json`), 0o644))
+		assert.Equal(t, "", LoadAPINameFromResearchDir(dir))
+	})
+
+	t.Run("empty string when api_name field missing", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "state.json"), []byte(`{"run_id":"20260514-070718"}`), 0o644))
+		assert.Equal(t, "", LoadAPINameFromResearchDir(dir))
+	})
 }
 
 func TestArchiveRunArtifactsCopiesDiscovery(t *testing.T) {
@@ -822,16 +876,40 @@ func TestWriteMCPBManifest(t *testing.T) {
 		shop, ok := got.UserConfig["shopify_shop"]
 		require.True(t, ok)
 		assert.Equal(t, "SHOPIFY_SHOP", shop.Title)
-		assert.True(t, shop.Required)
+		assert.True(t, shop.Required, "{shop} has no spec-level default; user must supply it")
 		assert.False(t, shop.Sensitive)
 		assert.Contains(t, shop.Description, "{shop}")
 
 		apiVersion, ok := got.UserConfig["shopify_api_version"]
 		require.True(t, ok)
 		assert.Equal(t, "SHOPIFY_API_VERSION", apiVersion.Title)
-		assert.True(t, apiVersion.Required)
+		assert.False(t, apiVersion.Required, "spec-defaulted vars are optional in MCPB user_config; presenting Required+Default together is contradictory and causes strict MCPB hosts to block install with the default pre-filled")
 		assert.Equal(t, "2026-04", apiVersion.Default)
 		assert.Contains(t, apiVersion.Description, "{api_version}")
+	})
+
+	t.Run("endpoint template var with spec-declared default is optional in user_config", func(t *testing.T) {
+		dir := t.TempDir()
+		writeManifest(t, dir, CLIManifest{
+			APIName:                     "freshservice",
+			DisplayName:                 "Freshservice",
+			MCPBinary:                   "freshservice-pp-mcp",
+			MCPReady:                    "full",
+			AuthType:                    "api_key",
+			AuthEnvVars:                 []string{"FRESHSERVICE_API_KEY"},
+			EndpointTemplateVars:        []string{"domain"},
+			EndpointTemplateVarDefaults: map[string]string{"domain": "yourcompany.freshservice.com"},
+		})
+
+		require.NoError(t, WriteMCPBManifest(dir))
+		got := readMCPBManifest(t, dir)
+
+		domain, ok := got.UserConfig["freshservice_domain"]
+		require.True(t, ok)
+		assert.Equal(t, "yourcompany.freshservice.com", domain.Default,
+			"spec-declared default flows through to MCPB user_config")
+		assert.False(t, domain.Required,
+			"Required: false avoids the install-blocking contradiction when MCPB hosts honor `required` strictly")
 	})
 
 	t.Run("composed auth emits optional user_config fields", func(t *testing.T) {
@@ -917,6 +995,83 @@ func TestWriteMCPBManifest(t *testing.T) {
 		assert.Equal(t, "Optional. Optional public selector.", optional.Description)
 		assert.NotContains(t, got.UserConfig, "rich_client_secret")
 		assert.NotContains(t, got.UserConfig, "rich_session")
+	})
+
+	t.Run("composed apiKey + bearer surfaces sibling creds in user_config and env", func(t *testing.T) {
+		dir := t.TempDir()
+		writeManifest(t, dir, CLIManifest{
+			APIName:     "stcompose",
+			DisplayName: "ServiceTitan Compose",
+			MCPBinary:   "stcompose-pp-mcp",
+			MCPReady:    "full",
+			AuthType:    "bearer_token",
+			AuthEnvVars: []string{"ST_CLIENT_ID", "ST_CLIENT_SECRET"},
+			AuthEnvVarSpecs: []spec.AuthEnvVar{
+				{Name: "ST_CLIENT_ID", Kind: spec.AuthEnvVarKindAuthFlowInput, Required: true, Sensitive: false},
+				{Name: "ST_CLIENT_SECRET", Kind: spec.AuthEnvVarKindAuthFlowInput, Required: true, Sensitive: true},
+			},
+			AuthAdditionalHeaders: []spec.AdditionalAuthHeader{
+				{
+					Header: "ST-App-Key",
+					In:     "header",
+					Scheme: "apiKeyHeader",
+					EnvVar: spec.AuthEnvVar{
+						Name:      "ST_APP_KEY",
+						Kind:      spec.AuthEnvVarKindPerCall,
+						Required:  true,
+						Sensitive: true,
+					},
+				},
+			},
+		})
+
+		require.NoError(t, WriteMCPBManifest(dir))
+		got := readMCPBManifest(t, dir)
+
+		assert.Equal(t, "${user_config.st_app_key}", got.Server.MCPConfig.Env["ST_APP_KEY"],
+			"sibling credential must forward through the launch env block")
+		uc, ok := got.UserConfig["st_app_key"]
+		require.True(t, ok, "user_config must prompt for the sibling apiKey credential")
+		assert.True(t, uc.Required)
+		assert.True(t, uc.Sensitive)
+	})
+
+	t.Run("sibling header credential surfaces even when primary env vars are absent", func(t *testing.T) {
+		// Defensive: a manifest carrying AuthAdditionalHeaders but no primary
+		// env vars (no AuthEnvVarSpecs, no AuthEnvVars) must still emit the
+		// sibling credential into user_config and the env block. The generator
+		// does not produce this combination today, but hand-crafted manifests
+		// and future auth shapes (e.g. OAuth where the primary credential is
+		// minted via a non-env code path) would otherwise silently 401.
+		dir := t.TempDir()
+		writeManifest(t, dir, CLIManifest{
+			APIName:   "siblings-only",
+			MCPBinary: "siblings-only-pp-mcp",
+			MCPReady:  "full",
+			AuthType:  "bearer_token",
+			AuthAdditionalHeaders: []spec.AdditionalAuthHeader{
+				{
+					Header: "X-Sibling-Key",
+					In:     "header",
+					Scheme: "apiKeyHeader",
+					EnvVar: spec.AuthEnvVar{
+						Name:      "SIBLINGS_ONLY_KEY",
+						Kind:      spec.AuthEnvVarKindPerCall,
+						Required:  true,
+						Sensitive: true,
+					},
+				},
+			},
+		})
+
+		require.NoError(t, WriteMCPBManifest(dir))
+		got := readMCPBManifest(t, dir)
+
+		assert.Equal(t, "${user_config.siblings_only_key}", got.Server.MCPConfig.Env["SIBLINGS_ONLY_KEY"])
+		uc, ok := got.UserConfig["siblings_only_key"]
+		require.True(t, ok, "sibling credential must surface in user_config")
+		assert.True(t, uc.Required)
+		assert.True(t, uc.Sensitive)
 	})
 
 	t.Run("auth metadata overrides user_config title and description", func(t *testing.T) {

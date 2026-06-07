@@ -1,12 +1,32 @@
 package profiler
 
 import (
+	"bytes"
+	"os"
 	"testing"
 
 	"github.com/mvanhorn/cli-printing-press/v4/internal/spec"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// captureStderr swaps os.Stderr for a pipe, runs fn, and returns whatever
+// fn wrote to stderr. The swap is single-threaded — safe for go test's
+// per-package sequential execution; do not use across parallel subtests
+// that both touch stderr.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stderr
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = orig })
+	fn()
+	require.NoError(t, w.Close())
+	var buf bytes.Buffer
+	_, _ = buf.ReadFrom(r)
+	return buf.String()
+}
 
 func TestProfilePetstore(t *testing.T) {
 	profile := Profile(petstoreSpec())
@@ -1253,6 +1273,137 @@ func TestProfileDependentResourceUnsetMetadata(t *testing.T) {
 	assert.False(t, profile.DependentSyncResources[0].Critical)
 }
 
+// TestProfileSyncableResourceSinceParamPropagation asserts that per-endpoint
+// since-like query parameter declarations flow into SyncableResource.SinceParam.
+// The sync template uses that field to skip incremental-cursor emission for
+// resources whose endpoint does not declare such a parameter, avoiding the
+// Notion-style 400 the blind-append behavior used to produce.
+func TestProfileSyncableResourceSinceParamPropagation(t *testing.T) {
+	s := &spec.APISpec{
+		Name: "mixed",
+		Resources: map[string]spec.Resource{
+			"events": {
+				Endpoints: map[string]spec.Endpoint{
+					"list": {
+						Method:   "GET",
+						Path:     "/v1/events",
+						Response: spec.ResponseDef{Type: "array"},
+						Params: []spec.Param{
+							{Name: "since", Type: "string"},
+						},
+					},
+				},
+			},
+			"audit": {
+				Endpoints: map[string]spec.Endpoint{
+					"list": {
+						Method:   "GET",
+						Path:     "/v1/audit",
+						Response: spec.ResponseDef{Type: "array"},
+						Params: []spec.Param{
+							{Name: "updated_after", Type: "string"},
+						},
+					},
+				},
+			},
+			"posts": {
+				Endpoints: map[string]spec.Endpoint{
+					"list": {
+						Method:   "GET",
+						Path:     "/v1/posts",
+						Response: spec.ResponseDef{Type: "array"},
+						Params: []spec.Param{
+							{Name: "modified_since", Type: "string"},
+						},
+					},
+				},
+			},
+			"changelog": {
+				Endpoints: map[string]spec.Endpoint{
+					"list": {
+						Method:   "GET",
+						Path:     "/v1/changelog",
+						Response: spec.ResponseDef{Type: "array"},
+						Params: []spec.Param{
+							{Name: "updated_at", Type: "string"},
+						},
+					},
+				},
+			},
+			"users": {
+				Endpoints: map[string]spec.Endpoint{
+					"list": {
+						Method:   "GET",
+						Path:     "/v1/users",
+						Response: spec.ResponseDef{Type: "array"},
+						Params:   []spec.Param{},
+					},
+				},
+			},
+		},
+	}
+
+	profile := Profile(s)
+	byName := make(map[string]SyncableResource, len(profile.SyncableResources))
+	for _, r := range profile.SyncableResources {
+		byName[r.Name] = r
+	}
+
+	require.Contains(t, byName, "events")
+	assert.Equal(t, "since", byName["events"].SinceParam, "literal since param should propagate verbatim")
+
+	require.Contains(t, byName, "audit")
+	assert.Equal(t, "updated_after", byName["audit"].SinceParam, "spec-declared name (not the profile-wide guess) wins")
+
+	require.Contains(t, byName, "posts")
+	assert.Equal(t, "modified_since", byName["posts"].SinceParam, "modified_since heuristic branch")
+
+	require.Contains(t, byName, "changelog")
+	assert.Equal(t, "updated_at", byName["changelog"].SinceParam, "updated_at heuristic branch")
+
+	require.Contains(t, byName, "users")
+	assert.Empty(t, byName["users"].SinceParam, "endpoints without a since-like param yield empty SinceParam — the sync template treats this as 'do not send'")
+}
+
+// TestProfileDependentResourceSinceParamPropagation mirrors
+// TestProfileSyncableResourceSinceParamPropagation for parameterized child
+// paths so dependent-resource sync gets the same per-endpoint gating as flat
+// resources.
+func TestProfileDependentResourceSinceParamPropagation(t *testing.T) {
+	s := &spec.APISpec{
+		Name: "chat",
+		Resources: map[string]spec.Resource{
+			"channels": {
+				Endpoints: map[string]spec.Endpoint{
+					"list": {
+						Method:   "GET",
+						Path:     "/channels",
+						Response: spec.ResponseDef{Type: "array"},
+					},
+				},
+			},
+			"messages": {
+				Endpoints: map[string]spec.Endpoint{
+					"list": {
+						Method:     "GET",
+						Path:       "/channels/{channel_id}/messages",
+						Response:   spec.ResponseDef{Type: "array"},
+						Pagination: &spec.Pagination{CursorParam: "after", LimitParam: "limit"},
+						Params: []spec.Param{
+							{Name: "channel_id", Type: "string", PathParam: true},
+							{Name: "modified_since", Type: "string"},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	profile := Profile(s)
+	require.Len(t, profile.DependentSyncResources, 1)
+	assert.Equal(t, "modified_since", profile.DependentSyncResources[0].SinceParam)
+}
+
 // TestProfileSyncableResourceShorterPathWinsMetadata asserts that when two
 // candidate endpoints can populate the same syncable resource, the shorter-path
 // rule that already governs the Path field also picks the IDField/Critical
@@ -1288,4 +1439,458 @@ func TestProfileSyncableResourceShorterPathWinsMetadata(t *testing.T) {
 	assert.Equal(t, "/v1/things", profile.SyncableResources[0].Path)
 	assert.Equal(t, "winner", profile.SyncableResources[0].IDField)
 	assert.True(t, profile.SyncableResources[0].Critical)
+}
+
+// TestProfileSpecWalker_AugmentsAutoDetected verifies that a spec-declared
+// walker on an already-auto-detected dependent endpoint overrides
+// ParentResource, ParentIDParam, and KeyField in place rather than creating
+// a duplicate entry. /orders/{account_id} would auto-detect "account_id" →
+// "accounts" (after _id stripping) — the walker redirects to "customers"
+// and pins a non-PK key.
+func TestProfileSpecWalker_AugmentsAutoDetected(t *testing.T) {
+	s := &spec.APISpec{
+		Name: "shop",
+		Resources: map[string]spec.Resource{
+			"accounts": {
+				Endpoints: map[string]spec.Endpoint{
+					"list": {Method: "GET", Path: "/accounts", Response: spec.ResponseDef{Type: "array"}},
+				},
+			},
+			"customers": {
+				Endpoints: map[string]spec.Endpoint{
+					"list": {Method: "GET", Path: "/customers", Response: spec.ResponseDef{Type: "array"}, IDField: "customer_key"},
+				},
+			},
+			"orders": {
+				Endpoints: map[string]spec.Endpoint{
+					"list": {
+						Method:   "GET",
+						Path:     "/accounts/{account_id}/orders",
+						Response: spec.ResponseDef{Type: "array"},
+						Walker: &spec.WalkerConfig{
+							Parent:   "customers",
+							KeyField: "customer_key",
+							KeyParam: "account_id",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	profile := Profile(s)
+	require.Len(t, profile.DependentSyncResources, 1, "augment must not duplicate the entry")
+	dep := profile.DependentSyncResources[0]
+	assert.Equal(t, "customers", dep.ParentResource, "walker must redirect parent away from auto-detect")
+	assert.Equal(t, "account_id", dep.ParentIDParam)
+	assert.Equal(t, "customer_key", dep.KeyField)
+	assert.Equal(t, "/accounts/{account_id}/orders", dep.Path)
+}
+
+// TestProfileSpecWalker_SynthesizesMissingDependent verifies that a spec-
+// declared walker creates a new DependentResource entry when auto-detection
+// would not have linked the endpoint, and that the synthesized Name comes
+// from the containing resource (matching detectDependentResources's naming
+// convention) rather than the endpoint map key.
+func TestProfileSpecWalker_SynthesizesMissingDependent(t *testing.T) {
+	s := &spec.APISpec{
+		Name: "fantasy",
+		Resources: map[string]spec.Resource{
+			"games": {
+				Endpoints: map[string]spec.Endpoint{
+					"list": {Method: "GET", Path: "/games", Response: spec.ResponseDef{Type: "array"}, IDField: "game_key"},
+				},
+			},
+			"leagues": {
+				Endpoints: map[string]spec.Endpoint{
+					"fetch_for_game": {
+						Method:   "GET",
+						Path:     "/games/{game_key}/leagues",
+						Response: spec.ResponseDef{Type: "array"},
+						Walker: &spec.WalkerConfig{
+							Parent:   "games",
+							KeyField: "game_key",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	profile := Profile(s)
+	// Exactly one dependent for the leagues endpoint, named from the
+	// containing resource ("leagues"), not the endpoint key
+	// ("fetch_for_game" → "fetch_for_game" via ToSnakeCase).
+	require.Len(t, profile.DependentSyncResources, 1)
+	dep := profile.DependentSyncResources[0]
+	assert.Equal(t, "leagues", dep.Name, "Name must come from resource, not endpoint key")
+	assert.Equal(t, "games", dep.ParentResource)
+	assert.Equal(t, "game_key", dep.KeyField)
+	assert.Equal(t, "game_key", dep.ParentIDParam, "single-placeholder path: KeyParam defaults to firstPathParam")
+	assert.Equal(t, "/games/{game_key}/leagues", dep.Path)
+}
+
+// TestProfileSpecWalker_SynthesizePropagatesSinceParam verifies that a
+// walker-synthesized DependentResource carries through endpoint-level
+// SinceParam — incremental sync stays available for walker-declared
+// hierarchical children, matching the auto-detect path's behavior.
+// Greptile flagged a P1 regression on the initial draft where the
+// synthesize branch dropped SinceParam (and Discriminator); this test
+// pins the fix.
+func TestProfileSpecWalker_SynthesizePropagatesSinceParam(t *testing.T) {
+	s := &spec.APISpec{
+		Name: "fantasy",
+		Resources: map[string]spec.Resource{
+			"games": {
+				Endpoints: map[string]spec.Endpoint{
+					"list": {Method: "GET", Path: "/games", Response: spec.ResponseDef{Type: "array"}, IDField: "game_key"},
+				},
+			},
+			"leagues": {
+				Endpoints: map[string]spec.Endpoint{
+					"list": {
+						Method:   "GET",
+						Path:     "/games/{game_key}/leagues",
+						Response: spec.ResponseDef{Type: "array"},
+						Params: []spec.Param{
+							{Name: "game_key", PathParam: true},
+							{Name: "since"},
+						},
+						Walker: &spec.WalkerConfig{
+							Parent:   "games",
+							KeyField: "game_key",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	profile := Profile(s)
+	require.Len(t, profile.DependentSyncResources, 1)
+	dep := profile.DependentSyncResources[0]
+	assert.Equal(t, "leagues", dep.Name)
+	assert.Equal(t, "since", dep.SinceParam,
+		"synthesize branch must propagate SinceParam via metaFromEndpoint — incremental sync depends on it")
+}
+
+// TestProfileSpecWalker_NonSyncableParentWarns verifies that a walker
+// pointing at a non-syncable parent emits a stderr warning and is dropped.
+// Explicit walker:: declarations carry author intent; silently dropping a
+// typo'd parent would produce passing builds with missing data.
+func TestProfileSpecWalker_NonSyncableParentWarns(t *testing.T) {
+	s := &spec.APISpec{
+		Name: "fantasy",
+		Resources: map[string]spec.Resource{
+			// "sports" is not syncable (GET-by-id only, no list).
+			"sports": {
+				Endpoints: map[string]spec.Endpoint{
+					"get": {Method: "GET", Path: "/sports/{sport_id}", Response: spec.ResponseDef{Type: "object"}},
+				},
+			},
+			"leagues": {
+				Endpoints: map[string]spec.Endpoint{
+					"list": {
+						Method:   "GET",
+						Path:     "/leagues",
+						Response: spec.ResponseDef{Type: "array"},
+						Walker: &spec.WalkerConfig{
+							Parent:   "sports",
+							KeyField: "sport_key",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	var profile *APIProfile
+	stderr := captureStderr(t, func() {
+		profile = Profile(s)
+	})
+
+	assert.Contains(t, stderr, "warning: walker on leagues.list")
+	assert.Contains(t, stderr, `parent "sports" is not a syncable resource`)
+	for _, dep := range profile.DependentSyncResources {
+		assert.NotEqual(t, "leagues", dep.Name,
+			"walker with non-syncable parent must be dropped, not produce a DependentResource")
+	}
+}
+
+// TestProfileSpecWalker_MultiPlaceholderPathWarns verifies that a walker on
+// a path with 2+ {...} placeholders requires an explicit key_param. Without
+// it, firstPathParam's "first wins" default would silently pick the parent
+// slot on a 2-deep path — almost always the wrong slot for the child.
+// With explicit key_param, the walker is accepted.
+func TestProfileSpecWalker_MultiPlaceholderPathWarns(t *testing.T) {
+	t.Run("ambiguous: warn and drop", func(t *testing.T) {
+		s := &spec.APISpec{
+			Name: "fantasy",
+			Resources: map[string]spec.Resource{
+				"games": {
+					Endpoints: map[string]spec.Endpoint{
+						"list": {Method: "GET", Path: "/games", Response: spec.ResponseDef{Type: "array"}, IDField: "game_key"},
+					},
+				},
+				"rosters": {
+					Endpoints: map[string]spec.Endpoint{
+						"list": {
+							Method:   "GET",
+							Path:     "/games/{game_key}/leagues/{league_id}/roster",
+							Response: spec.ResponseDef{Type: "array"},
+							Walker: &spec.WalkerConfig{
+								Parent: "games",
+								// no key_param — ambiguous on 2-placeholder path
+							},
+						},
+					},
+				},
+			},
+		}
+		var profile *APIProfile
+		stderr := captureStderr(t, func() {
+			profile = Profile(s)
+		})
+		assert.Contains(t, stderr, "warning: walker on rosters.list")
+		assert.Contains(t, stderr, "2 placeholders")
+		assert.Contains(t, stderr, "declare key_param explicitly")
+		for _, dep := range profile.DependentSyncResources {
+			assert.NotEqual(t, "rosters", dep.Name, "ambiguous walker must be dropped")
+		}
+	})
+
+	t.Run("explicit key_param: accepted", func(t *testing.T) {
+		s := &spec.APISpec{
+			Name: "fantasy",
+			Resources: map[string]spec.Resource{
+				"games": {
+					Endpoints: map[string]spec.Endpoint{
+						"list": {Method: "GET", Path: "/games", Response: spec.ResponseDef{Type: "array"}, IDField: "game_key"},
+					},
+				},
+				"rosters": {
+					Endpoints: map[string]spec.Endpoint{
+						"list": {
+							Method:   "GET",
+							Path:     "/games/{game_key}/leagues/{league_id}/roster",
+							Response: spec.ResponseDef{Type: "array"},
+							Walker: &spec.WalkerConfig{
+								Parent:   "games",
+								KeyField: "game_key",
+								KeyParam: "league_id",
+							},
+						},
+					},
+				},
+			},
+		}
+		profile := Profile(s)
+		var found bool
+		for _, dep := range profile.DependentSyncResources {
+			if dep.Name == "rosters" {
+				found = true
+				assert.Equal(t, "league_id", dep.ParentIDParam, "explicit key_param must be used verbatim")
+				assert.Equal(t, "game_key", dep.KeyField)
+			}
+		}
+		assert.True(t, found, "walker with explicit key_param must produce a dependent entry")
+	})
+}
+
+// Specs that declare pagination via plain offset+count query params (no
+// explicit pagination: block) must infer the cursor and limit names from
+// those params instead of falling back to "after"/"limit".
+func TestProfilePagination_InfersFromPlainParamsWhenNoExplicitBlock(t *testing.T) {
+	s := &spec.APISpec{
+		Name: "plain-param-pagination",
+		Resources: map[string]spec.Resource{
+			"agents": {
+				Endpoints: map[string]spec.Endpoint{
+					"list": {
+						Method:   "GET",
+						Path:     "/agents",
+						Params:   []spec.Param{{Name: "offset", Type: "int"}, {Name: "count", Type: "int"}},
+						Response: spec.ResponseDef{Type: "array"},
+					},
+				},
+			},
+			"builds": {
+				Endpoints: map[string]spec.Endpoint{
+					"list": {
+						Method:   "GET",
+						Path:     "/builds",
+						Params:   []spec.Param{{Name: "offset", Type: "int"}, {Name: "count", Type: "int"}},
+						Response: spec.ResponseDef{Type: "array"},
+					},
+				},
+			},
+		},
+	}
+
+	profile := Profile(s)
+	assert.Equal(t, "offset", profile.Pagination.CursorParam, "plain offset param must be picked up")
+	assert.Equal(t, "count", profile.Pagination.PageSizeParam, "plain count param must be picked up as limit")
+}
+
+// Explicit pagination: blocks must continue to win over plain-param inference.
+// Mixing the two on the same endpoint would otherwise double-count or let
+// inference shadow the author's deliberate choice.
+func TestProfilePagination_ExplicitBlockWinsOverInference(t *testing.T) {
+	s := &spec.APISpec{
+		Name: "explicit",
+		Resources: map[string]spec.Resource{
+			"items": {
+				Endpoints: map[string]spec.Endpoint{
+					"list": {
+						Method: "GET",
+						Path:   "/items",
+						Params: []spec.Param{
+							{Name: "offset", Type: "int"},
+							{Name: "count", Type: "int"},
+						},
+						Pagination: &spec.Pagination{
+							Type:        "cursor",
+							CursorParam: "foo",
+							LimitParam:  "bar",
+						},
+						Response: spec.ResponseDef{Type: "array"},
+					},
+				},
+			},
+		},
+	}
+
+	profile := Profile(s)
+	assert.Equal(t, "foo", profile.Pagination.CursorParam, "explicit cursor_param must win")
+	assert.Equal(t, "bar", profile.Pagination.PageSizeParam, "explicit limit_param must win")
+}
+
+// Specs with no recognizable pagination shape must keep the historical
+// after/limit defaults so existing golden output doesn't churn.
+func TestProfilePagination_NoPaginationParamsKeepsDefaults(t *testing.T) {
+	s := &spec.APISpec{
+		Name: "no-pagination",
+		Resources: map[string]spec.Resource{
+			"things": {
+				Endpoints: map[string]spec.Endpoint{
+					"list": {
+						Method:   "GET",
+						Path:     "/things",
+						Params:   []spec.Param{{Name: "filter", Type: "string"}},
+						Response: spec.ResponseDef{Type: "array"},
+					},
+				},
+			},
+		},
+	}
+
+	profile := Profile(s)
+	assert.Equal(t, "after", profile.Pagination.CursorParam)
+	assert.Equal(t, "limit", profile.Pagination.PageSizeParam)
+}
+
+// Inference must skip path params and positional args even when their names
+// match candidate sets (e.g. an /items/{page} path segment named "page").
+func TestProfilePagination_SkipsPathAndPositionalParams(t *testing.T) {
+	s := &spec.APISpec{
+		Name: "scoped",
+		Resources: map[string]spec.Resource{
+			"items": {
+				Endpoints: map[string]spec.Endpoint{
+					"list": {
+						Method: "GET",
+						Path:   "/items/{page}",
+						Params: []spec.Param{
+							{Name: "page", Type: "string", PathParam: true},
+							{Name: "offset", Type: "int", Positional: true},
+						},
+						Response: spec.ResponseDef{Type: "array"},
+					},
+				},
+			},
+		},
+	}
+
+	profile := Profile(s)
+	assert.Equal(t, "after", profile.Pagination.CursorParam, "path-param 'page' must not be treated as a cursor")
+	assert.Equal(t, "limit", profile.Pagination.PageSizeParam)
+}
+
+// TestProfileTemplateVarPathBecomesFlatSyncable: paths whose only
+// {placeholder} is an EndpointTemplateVar (e.g. /tenant/{tenant}/<resource>
+// when the spec declares x-tenant-env-var) are runtime-resolvable through
+// buildURL — they should become flat SyncableResources rather than landing
+// in DependentSyncResources (which would require iterating a non-existent
+// parent table).
+func TestProfileTemplateVarPathBecomesFlatSyncable(t *testing.T) {
+	s := &spec.APISpec{
+		Name:                 "servicetitan",
+		EndpointTemplateVars: []string{"tenant"},
+		EndpointTemplateEnvOverrides: map[string]string{
+			"tenant": "ST_TENANT_ID",
+		},
+		Resources: map[string]spec.Resource{
+			"customers": {
+				Endpoints: map[string]spec.Endpoint{
+					"list": {
+						Method:     "GET",
+						Path:       "/tenant/{tenant}/customers",
+						Pagination: &spec.Pagination{CursorParam: "pageToken", LimitParam: "pageSize"},
+						Response:   spec.ResponseDef{Type: "array"},
+					},
+				},
+			},
+		},
+	}
+
+	profile := Profile(s)
+	require.Len(t, profile.SyncableResources, 1, "tenant-scoped resource must surface as a flat SyncableResource")
+	assert.Equal(t, "customers", profile.SyncableResources[0].Name)
+	assert.Equal(t, "/tenant/{tenant}/customers", profile.SyncableResources[0].Path,
+		"path must preserve the {tenant} placeholder for buildURL to substitute")
+	assert.Empty(t, profile.DependentSyncResources, "tenant placeholder is not a parent context — must not become a DependentResource")
+}
+
+// TestProfileMixedPlaceholdersNotPromoted guards against over-eager
+// promotion: paths mixing a template-var placeholder with a real parent-
+// context placeholder must NOT be promoted to flat sync. The dependent-
+// resource matching is governed elsewhere; here we only pin the negative
+// (no false promotion) since that's what regression on this change would
+// look like.
+func TestProfileMixedPlaceholdersNotPromoted(t *testing.T) {
+	s := &spec.APISpec{
+		Name:                 "servicetitan",
+		EndpointTemplateVars: []string{"tenant"},
+		Resources: map[string]spec.Resource{
+			"channels": {
+				Endpoints: map[string]spec.Endpoint{
+					"list": {
+						Method:     "GET",
+						Path:       "/tenant/{tenant}/channels",
+						Pagination: &spec.Pagination{CursorParam: "cursor", LimitParam: "limit"},
+						Response:   spec.ResponseDef{Type: "array"},
+					},
+				},
+			},
+			"messages": {
+				Endpoints: map[string]spec.Endpoint{
+					"list": {
+						Method:     "GET",
+						Path:       "/tenant/{tenant}/channels/{channel_id}/messages",
+						Pagination: &spec.Pagination{CursorParam: "cursor", LimitParam: "limit"},
+						Response:   spec.ResponseDef{Type: "array"},
+					},
+				},
+			},
+		},
+	}
+
+	profile := Profile(s)
+	flatNames := make([]string, 0, len(profile.SyncableResources))
+	for _, r := range profile.SyncableResources {
+		flatNames = append(flatNames, r.Name)
+	}
+	assert.Contains(t, flatNames, "channels", "tenant-only path is flat")
+	assert.NotContains(t, flatNames, "messages",
+		"a path containing {channel_id} alongside the template var must not flatten into SyncableResources")
 }

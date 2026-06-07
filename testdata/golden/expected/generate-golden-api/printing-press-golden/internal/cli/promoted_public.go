@@ -14,10 +14,10 @@ import (
 func newPublicPromotedCmd(flags *rootFlags) *cobra.Command {
 
 	cmd := &cobra.Command{
-		Use:   "public",
-		Short: "Get public service status",
-		Long:  "Shortcut for 'public get-status'. Get public service status",
-		Example: "  printing-press-golden-pp-cli public",
+		Use:         "public",
+		Short:       "Get public service status",
+		Long:        "Shortcut for 'public get-status'. Get public service status",
+		Example:     "  printing-press-golden-pp-cli public",
 		Annotations: map[string]string{"pp:endpoint": "public.get-status", "pp:method": "GET", "pp:path": "/public/status", "mcp:read-only": "true"},
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := flags.newClient()
@@ -35,8 +35,12 @@ func newPublicPromotedCmd(flags *rootFlags) *cobra.Command {
 			// so output helpers see the inner data, not the wrapper.
 			data = extractResponseData(data)
 
-			// Print provenance to stderr
-			{
+			// Print provenance to stderr for human-facing output only.
+			// Machine-format flags (--json, --csv, --compact, --quiet, --plain,
+			// --select) and piped stdout suppress this line; the JSON envelope
+			// already carries meta.source for those consumers.
+			// SYNC: keep this gate aligned with command_endpoint.go.tmpl.
+			if wantsHumanTable(cmd.OutOrStdout(), flags) {
 				var countItems []json.RawMessage
 				if json.Unmarshal(data, &countItems) != nil {
 					// Single object, not an array

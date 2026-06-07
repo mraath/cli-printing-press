@@ -111,8 +111,11 @@ type LiveCheckOptions struct {
 	// instead of CLIDir. Use this when invoking live-check from a working
 	// directory the run state owns (where research.json lives next to the
 	// run's manuscripts) and the printed CLI hasn't been promoted to its
-	// final library location. Leave blank to keep the historical behavior
-	// of looking for research.json under CLIDir.
+	// final library location. When blank the live check looks under CLIDir
+	// and then walks up a few parent levels (see findResearchDir) so the
+	// standard pipeline layout — research.json at the run-dir level, CLI
+	// under <runRoot>/working/<api>-pp-cli — works without an explicit
+	// override.
 	ResearchDir string
 	// BinaryName, when non-empty, names the executable to run. Leave blank
 	// to let RunLiveCheck derive it from CLIDir (tries `<base>-pp-cli`,
@@ -133,6 +136,13 @@ type LiveCheckOptions struct {
 // check doesn't penalize the CLI.
 func RunLiveCheck(opts LiveCheckOptions) *LiveCheckResult {
 	out := &LiveCheckResult{RanAt: time.Now().UTC()}
+	releaseHome, err := scopeSubprocessHome()
+	if err != nil {
+		out.Unable = true
+		out.Reason = err.Error()
+		return out
+	}
+	defer releaseHome()
 
 	if opts.CLIDir == "" {
 		out.Unable = true
@@ -142,7 +152,7 @@ func RunLiveCheck(opts LiveCheckOptions) *LiveCheckResult {
 
 	researchDir := opts.ResearchDir
 	if researchDir == "" {
-		researchDir = opts.CLIDir
+		researchDir = findResearchDir(opts.CLIDir)
 	}
 	research, err := LoadResearch(researchDir)
 	if err != nil {
@@ -203,6 +213,41 @@ func RunLiveCheck(opts LiveCheckOptions) *LiveCheckResult {
 	return out
 }
 
+// researchParentWalkDepth bounds how far above CLIDir the live check looks
+// for research.json. The standard pipeline lays out
+// <runRoot>/working/<api>-pp-cli, putting research.json two levels above
+// CLIDir; three is a small margin for layouts that add a wrapper directory
+// without inviting scans that could pick up unrelated research.json files
+// far above the working tree.
+const researchParentWalkDepth = 3
+
+// findResearchDir returns a directory containing research.json that the
+// live check can hand to LoadResearch. It first checks cliDir itself, then
+// walks up the parent chain up to researchParentWalkDepth levels. If no
+// research.json is found, cliDir is returned so the caller's error message
+// stays "no research.json: ... <cliDir>/research.json".
+//
+// The walk handles the canonical non-OpenAPI layout where research.json
+// sits at the run-dir level while the printed CLI lives under
+// <runRoot>/working/<api>-pp-cli.
+func findResearchDir(cliDir string) string {
+	if cliDir == "" {
+		return cliDir
+	}
+	dir := cliDir
+	for steps := 0; steps <= researchParentWalkDepth; steps++ {
+		if _, err := os.Stat(filepath.Join(dir, "research.json")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	return cliDir
+}
+
 // resolveBinaryPath returns the absolute path to the CLI binary. When name
 // is non-empty it's used verbatim; otherwise RunLiveCheck tries the common
 // `<base>-pp-cli` naming convention and falls back to `<base>`.
@@ -231,13 +276,23 @@ func liveCheckBinaryCandidatesForGOOS(cliDir, name, goos string) []string {
 		base := filepath.Base(cliDir)
 		names = []string{base + "-pp-cli", base}
 	}
-	candidates := make([]string, 0, len(names)*2)
+	// Resolution order (per issue #1150):
+	//   1. <cliDir>/build/stage/bin/<name>           canonical Unix
+	//   2. <cliDir>/build/stage/bin/<name>.exe       canonical Windows
+	//   3. <cliDir>/<name>                           legacy fallback
+	//   4. <cliDir>/<name>.exe                       legacy Windows fallback
+	// The generator's --validate "build runnable binary" gate emits the
+	// binary under build/stage/bin/; older layouts left it at cliDir.
+	stagedDir := filepath.Join(cliDir, "build", "stage", "bin")
+	candidates := make([]string, 0, len(names)*4)
 	seen := map[string]struct{}{}
 	for _, candidate := range names {
 		if candidate == "" {
 			continue
 		}
 		for _, path := range []string{
+			filepath.Join(stagedDir, candidate),
+			platform.ExecutablePathForGOOS(filepath.Join(stagedDir, candidate), goos),
 			filepath.Join(cliDir, candidate),
 			platform.ExecutablePathForGOOS(filepath.Join(cliDir, candidate), goos),
 		} {
@@ -350,6 +405,7 @@ func runOneFeatureCheck(cliDir, binaryPath string, f NovelFeature, timeout time.
 
 	cmd := exec.CommandContext(ctx, binaryPath, args...)
 	cmd.Dir = cliDir
+	applyDefaultSubprocessEnv(cmd)
 	// Capture stdout into a bounded buffer. An unbounded `cmd.Output()` call
 	// would let a misbehaving feature exhaust the scorecard's memory.
 	stdoutCap := &bytes.Buffer{}

@@ -31,9 +31,11 @@ in the same change as any new `Extensions["x-*"]` lookup in that file.
 | `x-auth-description` | `components.securitySchemes.<name>` | `APISpec.Auth.Description` | No |
 | `x-auth-cookie-domain` | `components.securitySchemes.<name>` | `APISpec.Auth.CookieDomain` | No |
 | `x-auth-cookies` | `components.securitySchemes.<name>` | `APISpec.Auth.Cookies` | No |
+| `x-oauth-refresh-token-mechanism` | `components.securitySchemes.<name>` | `APISpec.Auth.RefreshTokenMechanism` | No |
 | `x-resource-id` | path item | `Endpoint.IDField` | No |
 | `x-critical` | path item | `Endpoint.Critical` | No |
 | `x-tier` | path item or operation | `Endpoint.Tier` | No |
+| `x-pp-sync-walker` | operation | `Endpoint.Walker` | No |
 
 ## `info` Extensions
 
@@ -217,6 +219,51 @@ x-mcp:
   endpoint_tools: hidden
 ```
 
+### `x-tenant-env-var`
+
+Declares the env-var name that resolves the implicit `{tenant}` path
+placeholder for multi-tenant SaaS APIs whose every path is
+`/tenant/{tenant}/<resource>`. Without this annotation, the generator
+classifies tenant-templated paths as parent-context-dependent and emits an
+empty `defaultSyncResources` / `syncResourcePath` map; sync silently no-ops
+and every downstream offline command ships broken.
+
+Parsed fields: `APISpec.EndpointTemplateVars` (`tenant` added) and
+`APISpec.EndpointTemplateEnvOverrides["tenant"]` (env-var name).
+
+Rules:
+- Optional. Specs without `x-tenant-env-var` keep single-tenant behavior;
+  no `{tenant}`-aware emission, no spurious env reads.
+- Declared under `info` only (path-positional templates are spec-wide).
+- Value must be a non-empty string after `TrimSpace`. Whitespace-only
+  values are treated as absent.
+- The placeholder name is `tenant`. Specs that use a different
+  placeholder (`{workspace}`, `{org}`) should set
+  `EndpointTemplateVars` + `EndpointTemplateEnvOverrides` directly in
+  internal YAML until this extension generalizes.
+
+Effect on generated output (when set):
+- The profiler treats `/.../{tenant}/...` paths as standalone-listable, so
+  the resource becomes a flat `SyncableResource` rather than a
+  `DependentSyncResource`.
+- The emitted `config.go` reads the override env-var name (e.g.
+  `ST_TENANT_ID`) into `Config.TemplateVars["tenant"]` at `Load()` time.
+- The emitted `url.go` `buildURL` substitutes `{tenant}` from
+  `Config.TemplateVars` at request time and names the override env var in
+  the actionable error when the value is missing.
+- The emitted `sync.go` filters `{tenant}` out of the unresolved-key
+  warning so per-tenant paths don't get skipped as "requires parent
+  context".
+
+Example:
+
+```yaml
+info:
+  title: ServiceTitan CRM
+  version: 1.0.0
+  x-tenant-env-var: ST_TENANT_ID
+```
+
 ## Security Scheme Extensions
 
 Security scheme extensions are read from
@@ -296,6 +343,15 @@ Rules:
 - Empty and non-string list items are ignored.
 - When at least one non-empty item is present, the list replaces the parser's
   generated env var names.
+
+Catalog-driven equivalent: when a catalog entry declares `auth_env_vars`, the
+generator layers the canonical names on top of the parser-derived default at
+runtime without editing the upstream spec. The catalog list takes precedence,
+the parser default trails as a backwards-compat fallback, and the rebuilt env
+var list is emitted as an OR-case (any one satisfies auth). The catalog field
+is ignored for HTTP Basic auth (credential-pair shape); declare basic-auth
+env var pairs via `x-auth-env-vars` on the security scheme instead. See
+[`docs/CATALOG.md`](CATALOG.md#auth_env_vars).
 
 ### `x-auth-vars`
 
@@ -495,6 +551,58 @@ components:
         - csrf_token
 ```
 
+### `x-oauth-refresh-token-mechanism`
+
+Declares how the authorization endpoint should be asked to issue a refresh
+token. Providers diverge: Google reads `access_type=offline` as a query
+parameter, while WHOOP, X/Twitter, and others read a magic scope value
+(`offline`, `offline.access`, `offline_access`) instead. The generator emits
+neither by default because a Google-shaped silent default silently breaks
+other providers (broken refresh path is invisible until access-token TTL
+expires).
+
+Parsed field: `APISpec.Auth.RefreshTokenMechanism`
+
+Rules:
+
+- Optional. Only consumed by the authorization_code grant template; ignored
+  for other grants and non-OAuth2 auth.
+- Must be a string. Leading and trailing whitespace on the whole value is
+  trimmed.
+- Two exact-match prefixes are accepted:
+  - `scope:<value>` appends `<value>` to the scope list. No query param is
+    added.
+  - `query:<key>=<value>` sets the query parameter exactly once. No scope
+    change.
+- Malformed values (empty key, empty value, missing `=` for `query`, unknown
+  prefix, uppercase prefix) are ignored and produce no emission.
+- For `query:<key>=<value>`, the reserved authorization-URL parameter names
+  `client_id`, `redirect_uri`, `response_type`, `state`, and `scope` are
+  rejected. Permitting them would let a spec author silently overwrite the
+  generator's CSRF state token or core OAuth params.
+- Note: the single-mechanism shape cannot express Google's two-param recipe
+  (`access_type=offline` + `prompt=consent`). The first param is sufficient
+  for refresh-token issuance on initial consent; the second forces re-consent
+  on subsequent logins to keep the refresh-token contract alive. Specs that
+  need both should declare one via this extension and add the other through a
+  future multi-mechanism syntax (out of scope here).
+
+Example:
+
+```yaml
+components:
+  securitySchemes:
+    OAuth2:
+      type: oauth2
+      x-oauth-refresh-token-mechanism: scope:offline
+      flows:
+        authorizationCode:
+          authorizationUrl: https://api.example.com/oauth/authorize
+          tokenUrl: https://api.example.com/oauth/token
+          scopes:
+            read: Read access
+```
+
 ## Path Item Extensions
 
 Path item extensions are read from a path object, beside its HTTP operations.
@@ -588,6 +696,77 @@ paths:
   /premium/search:
     get:
       x-tier: paid
+      responses:
+        "200": {description: ok}
+```
+
+### `x-pp-sync-walker`
+
+Declares a hierarchical-walk dependency for a child endpoint. Synthesizes (or
+augments) a dependent-resource entry so the generator's existing
+parent-child sync machinery handles the fan-out — fetch the parent, extract
+the named field from each parent record, substitute it into the child path,
+fetch each child.
+
+Use this when the auto-detected parent-child link in the profiler would miss
+your endpoint or pick the wrong parent. Common cases:
+
+- The child path's placeholder name does not match a parent resource (e.g.
+  `/games/{game_key}/leagues` — `game_key` does not stem to "games" via the
+  default `_id`/`_key` stripping).
+- The parent placeholder lives in a matrix or query parameter rather than the
+  path, so the path has no `{placeholder}` for auto-detection to read.
+- The child path uses a parent field that is not the parent's primary key
+  (e.g. Yahoo Fantasy's `game_key`, Reddit's `subreddit` name).
+
+Parsed field: `Endpoint.Walker` (a `*spec.WalkerConfig`)
+
+Rules:
+- Optional.
+- Operation-level only. (No path-item-level form today.)
+- `parent` (string, required): the resource name to iterate. The parent must
+  itself be a syncable resource (i.e., have a flat-list endpoint). Walkers
+  pointing at non-syncable parents emit a `warning:` to stderr at generate
+  time and are dropped.
+- `key_field` (string, optional): the field to extract from each parent
+  record for substitution into the child path. Defaults to the parent's
+  primary key. Set this when the child path needs a non-PK field.
+- `key_param` (string, optional): the placeholder name in the child path
+  that receives the extracted value. Defaults to the first (and only)
+  `{placeholder}` in the child path when there is exactly one. **Required
+  explicitly when the child path has 0 or 2+ placeholders** — the
+  single-placeholder default would otherwise pick the wrong slot (or no
+  slot at all). The generator warns and drops the walker when it's ambiguous
+  and `key_param` is missing.
+- Walker-emitted dependents flow through the same `syncDependentResource`
+  machinery as auto-detected ones, so concurrency/retry/cursor/Upsert
+  behavior is identical.
+
+Internal YAML emits this as `walker:` on the endpoint with the same
+sub-field names (`parent`, `key_field`, `key_param`). Both surfaces parse
+to the same `WalkerConfig` struct.
+
+Example:
+
+```yaml
+paths:
+  /games:
+    get:
+      summary: List games (parent for the walker below)
+      responses:
+        "200": {description: ok}
+  /games/{game_key}/leagues:
+    get:
+      summary: List leagues for a game
+      x-pp-sync-walker:
+        parent: games
+        key_field: game_key
+        key_param: game_key
+      parameters:
+        - name: game_key
+          in: path
+          required: true
+          schema: {type: string}
       responses:
         "200": {description: ok}
 ```
