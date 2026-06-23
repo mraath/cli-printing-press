@@ -1,0 +1,475 @@
+openapi: 3.0.3
+info:
+  title: Surfline API
+  version: "1.0.0"
+  description: |
+    Surfline surf forecast API - reverse-engineered from surfline.com.
+    Provides wave, tide, wind, and condition forecasts for surf spots worldwide.
+  x-api-name: surfline
+  x-display-name: Surfline
+  x-website: https://www.surfline.com
+  x-auth-cookie-domain: .surfline.com
+  x-auth-cookies:
+    - access_token
+    - refresh_token
+
+servers:
+  - url: https://services.surfline.com
+
+security:
+  - cookieAuth: []
+
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: header
+      name: Cookie
+      x-auth-type: cookie
+      x-auth-cookie-domain: .surfline.com
+      x-auth-cookies:
+        - access_token
+        - refresh_token
+      description: |
+        Browser session cookie captured via Cookie-Editor extension.
+        Export from surfline.com as "Header String" and set as SURFLINE_COOKIE env var.
+
+  schemas:
+    Spot:
+      type: object
+      properties:
+        _id:
+          type: string
+          description: Spot ID (24-char hex)
+        name:
+          type: string
+        subregionId:
+          type: string
+        lat:
+          type: number
+        lon:
+          type: number
+
+    WaveForecast:
+      type: object
+      properties:
+        timestamp:
+          type: integer
+          description: Unix timestamp
+        surf:
+          type: object
+          properties:
+            min:
+              type: number
+            max:
+              type: number
+            plus:
+              type: boolean
+        swell:
+          type: array
+          items:
+            type: object
+            properties:
+              height:
+                type: number
+              period:
+                type: number
+              direction:
+                type: number
+              directionType:
+                type: string
+
+    TideEvent:
+      type: object
+      properties:
+        timestamp:
+          type: integer
+        height:
+          type: number
+        type:
+          type: string
+          enum: [HIGH, LOW, NORMAL]
+
+    WindForecast:
+      type: object
+      properties:
+        timestamp:
+          type: integer
+        speed:
+          type: number
+        direction:
+          type: number
+        directionType:
+          type: string
+        gustSpeed:
+          type: number
+
+    OverviewDay:
+      type: object
+      properties:
+        date:
+          type: string
+          format: date
+        surf:
+          type: object
+          properties:
+            min:
+              type: integer
+            max:
+              type: integer
+            plus:
+              type: boolean
+        rating:
+          type: object
+          properties:
+            am:
+              $ref: '#/components/schemas/RatingSlot'
+            midday:
+              $ref: '#/components/schemas/RatingSlot'
+            pm:
+              $ref: '#/components/schemas/RatingSlot'
+
+    RatingSlot:
+      type: object
+      properties:
+        key:
+          type: string
+          enum: [FLAT, VERY_POOR, POOR, POOR_TO_FAIR, FAIR, FAIR_TO_GOOD, GOOD, GOOD_TO_EPIC, EPIC]
+        value:
+          type: integer
+
+    SearchHit:
+      type: object
+      properties:
+        _id:
+          type: string
+        _source:
+          type: object
+          properties:
+            name:
+              type: string
+            type:
+              type: string
+            subregionId:
+              type: string
+
+paths:
+  /kbyg/spots/forecasts/wave:
+    get:
+      operationId: getWaveForecast
+      summary: Get hourly wave forecast for a spot
+      description: Returns hourly wave height data for up to 7 days
+      x-endpoint: wave.get
+      tags: [forecasts]
+      parameters:
+        - name: spotId
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Surfline spot ID (24-char hex)
+        - name: days
+          in: query
+          schema:
+            type: integer
+            default: 5
+            maximum: 7
+          description: Number of days to forecast
+        - name: intervalHours
+          in: query
+          schema:
+            type: integer
+            default: 1
+          description: Hourly interval
+        - name: cacheEnabled
+          in: query
+          schema:
+            type: string
+            default: "true"
+        - name: units[waveHeight]
+          in: query
+          schema:
+            type: string
+            default: FT
+            enum: [FT, M]
+        - name: units[swellHeight]
+          in: query
+          schema:
+            type: string
+            default: FT
+            enum: [FT, M]
+      responses:
+        '200':
+          description: Wave forecast data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      wave:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/WaveForecast'
+
+  /kbyg/spots/forecasts/tides:
+    get:
+      operationId: getTideForecast
+      summary: Get tide forecast for a spot
+      description: Returns tide events (high/low/normal) for up to 7 days
+      x-endpoint: tides.get
+      tags: [forecasts]
+      parameters:
+        - name: spotId
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: days
+          in: query
+          schema:
+            type: integer
+            default: 5
+            maximum: 7
+        - name: units[tideHeight]
+          in: query
+          schema:
+            type: string
+            default: FT
+            enum: [FT, M]
+      responses:
+        '200':
+          description: Tide forecast data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      tides:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/TideEvent'
+
+  /kbyg/spots/forecasts/wind:
+    get:
+      operationId: getWindForecast
+      summary: Get hourly wind forecast for a spot
+      description: Returns hourly wind speed and direction for up to 7 days
+      x-endpoint: wind.get
+      tags: [forecasts]
+      parameters:
+        - name: spotId
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: days
+          in: query
+          schema:
+            type: integer
+            default: 5
+            maximum: 7
+        - name: intervalHours
+          in: query
+          schema:
+            type: integer
+            default: 1
+      responses:
+        '200':
+          description: Wind forecast data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      wind:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/WindForecast'
+
+  /kbyg/spots/forecasts-overview:
+    get:
+      operationId: getOverview
+      summary: Get multi-day overview forecast for multiple spots
+      description: Returns daily ratings and wave heights for up to 16 days
+      x-endpoint: overview.get
+      tags: [forecasts]
+      parameters:
+        - name: spotIds
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Comma-separated spot IDs
+        - name: days
+          in: query
+          schema:
+            type: integer
+            default: 7
+            maximum: 16
+        - name: cacheEnabled
+          in: query
+          schema:
+            type: string
+            default: "true"
+        - name: units[waveHeight]
+          in: query
+          schema:
+            type: string
+            default: FT
+      responses:
+        '200':
+          description: Overview forecast data
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      overview:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            spotId:
+                              type: string
+                            days:
+                              type: array
+                              items:
+                                $ref: '#/components/schemas/OverviewDay'
+                            surf:
+                              type: array
+                              items:
+                                type: object
+                                properties:
+                                  timestamp:
+                                    type: integer
+                                  max:
+                                    type: number
+
+  /kbyg/mapview:
+    get:
+      operationId: getMapView
+      summary: Get spots in a geographic region
+      description: Returns all surf spots within a bounding box
+      x-endpoint: mapview.get
+      tags: [spots]
+      parameters:
+        - name: south
+          in: query
+          required: true
+          schema:
+            type: number
+        - name: north
+          in: query
+          required: true
+          schema:
+            type: number
+        - name: west
+          in: query
+          required: true
+          schema:
+            type: number
+        - name: east
+          in: query
+          required: true
+          schema:
+            type: number
+      responses:
+        '200':
+          description: Map view with spots
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      spots:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Spot'
+
+  /search/site:
+    get:
+      operationId: searchSpots
+      summary: Search for surf spots by name
+      description: Returns matching spots from the Surfline database
+      x-endpoint: search.get
+      tags: [spots]
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Search query (spot name)
+        - name: querySize
+          in: query
+          schema:
+            type: integer
+            default: 10
+        - name: suggestionSize
+          in: query
+          schema:
+            type: integer
+            default: 5
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    hits:
+                      type: object
+                      properties:
+                        hits:
+                          type: array
+                          items:
+                            $ref: '#/components/schemas/SearchHit'
+
+  /kbyg/regions/forecasts/conditions:
+    get:
+      operationId: getRegionalConditions
+      summary: Get regional forecast conditions
+      description: Returns condition ratings for a subregion
+      x-endpoint: conditions.get
+      tags: [forecasts]
+      parameters:
+        - name: subregionId
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: days
+          in: query
+          schema:
+            type: integer
+            default: 10
+      responses:
+        '200':
+          description: Regional conditions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      type: object

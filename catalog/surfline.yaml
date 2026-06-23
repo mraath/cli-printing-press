@@ -1,0 +1,34 @@
+name: surfline
+display_name: Surfline
+description: Surf forecast data for Bali and global spots - wave height, tides, wind, conditions. Uses browser cookie auth to bypass Cloudflare.
+category: travel
+spec_url: https://raw.githubusercontent.com/mvanhorn/cli-printing-press/main/catalog/specs/surfline-spec.yaml
+spec_format: yaml
+openapi_version: "3.0"
+tier: community
+verified_date: "2026-06-23"
+homepage: https://www.surfline.com
+notes: |
+  Surfline does not publish a public API. The endpoints below are reverse-engineered
+  from the surfline.com website traffic. Authentication uses browser cookies captured
+  via Cookie-Editor Chrome extension.
+
+  Key endpoints:
+    - Wave forecast (hourly, 7-day)
+    - Tide forecast (hourly, 7-day)
+    - Wind forecast (hourly, 7-day)
+    - Overview forecast (daily, 16-day)
+    - Spot search
+    - Regional map view
+
+  Auth model: Cookie-based session from browser. The access_token cookie must be
+  refreshed periodically (typically expires after ~30 days). Cloudflare blocks
+  non-browser requests, so the CLI must send full browser-like headers.
+
+  Known Bali spot IDs:
+    - Balangan: 5842041f4e65fad6a7708d3a
+    - Impossibles: 5842041f4e65fad6a7708b4b
+    - Uluwatu: 5842041f4e65fad6a7708d3b
+    - Padang Padang: 5842041f4e65fad6a7708d3c
+    - Dreamland: 5842041f4e65fad6a7708d42
+    - Medewi: 5842041f4e65fad6a7708d43
