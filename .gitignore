@@ -16,3 +16,6 @@ claude-upgrade-progress.json
 # Local AI agent instructions (not for sharing)
 CLAUDE.local.md
 AGENTS.override.md
+
+# Graphify tool output
+graphify-out/
