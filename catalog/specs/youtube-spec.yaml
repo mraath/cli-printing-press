@@ -1,0 +1,211 @@
+openapi: 3.0.3
+info:
+  title: YouTube InnerTube API
+  version: "1.0.0"
+  description: |
+    YouTube's internal InnerTube API — reverse-engineered from youtube.com.
+    Provides watch history, video details, and channel data using the same
+    session cookies as your Google account (Gmail cookies work here too).
+  x-api-name: youtube
+  x-display-name: YouTube
+  x-website: https://www.youtube.com
+  x-auth-cookie-domain: .youtube.com
+  x-auth-cookies:
+    - __Secure-1PSID
+    - __Secure-3PSID
+    - SAPISID
+    - SID
+
+servers:
+  - url: https://www.youtube.com
+
+security:
+  - cookieAuth: []
+
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: header
+      name: Cookie
+      x-auth-type: cookie
+      x-auth-cookie-domain: .youtube.com
+      x-auth-cookies:
+        - __Secure-1PSID
+        - __Secure-3PSID
+        - SAPISID
+        - SID
+      description: |
+        Google session cookies captured via Cookie-Editor extension from youtube.com.
+        Export as "Header String" and set as YOUTUBE_COOKIE_AUTH env var.
+        These are the same cookies as your Gmail/Google session.
+
+  schemas:
+    ClientContext:
+      type: object
+      properties:
+        client:
+          type: object
+          properties:
+            clientName:
+              type: string
+              example: WEB
+            clientVersion:
+              type: string
+              example: "2.20241030.06.00"
+            hl:
+              type: string
+              example: en
+            gl:
+              type: string
+              example: US
+
+    BrowseRequest:
+      type: object
+      required:
+        - context
+        - browseId
+      properties:
+        context:
+          $ref: '#/components/schemas/ClientContext'
+        browseId:
+          type: string
+          description: |
+            Browse endpoint ID.
+            FEhistory = watch history
+            FElibrary = library
+        continuation:
+          type: string
+          description: Pagination token from previous response
+
+    BrowseResponse:
+      type: object
+      properties:
+        contents:
+          type: object
+          description: Top-level content container
+        continuationContents:
+          type: object
+          description: Continuation page content
+        header:
+          type: object
+
+    VideoDetailsRequest:
+      type: object
+      required:
+        - context
+        - videoId
+      properties:
+        context:
+          $ref: '#/components/schemas/ClientContext'
+        videoId:
+          type: string
+          description: YouTube video ID (11 chars)
+
+    VideoDetailsResponse:
+      type: object
+      properties:
+        videoDetails:
+          type: object
+          properties:
+            videoId:
+              type: string
+            title:
+              type: string
+            lengthSeconds:
+              type: string
+            channelId:
+              type: string
+            author:
+              type: string
+            viewCount:
+              type: string
+            shortDescription:
+              type: string
+        microformat:
+          type: object
+
+paths:
+  /youtubei/v1/browse:
+    post:
+      operationId: browseHistory
+      summary: Fetch watch history (or any browse page)
+      description: |
+        Fetches watch history when browseId is "FEhistory".
+        Use continuation token to paginate through older history.
+        Filter by date client-side — the API returns newest-first.
+      x-endpoint: history.browse
+      tags: [history]
+      parameters:
+        - name: key
+          in: query
+          required: false
+          schema:
+            type: string
+            default: AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8
+          description: InnerTube API key (public, does not change often)
+        - name: prettyPrint
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BrowseRequest'
+            example:
+              context:
+                client:
+                  clientName: WEB
+                  clientVersion: "2.20241030.06.00"
+                  hl: en
+                  gl: US
+              browseId: FEhistory
+      responses:
+        '200':
+          description: Browse page response with video list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BrowseResponse'
+        '401':
+          description: Not authenticated — check YOUTUBE_COOKIE_AUTH
+
+  /youtubei/v1/player:
+    post:
+      operationId: getVideoDetails
+      summary: Get details for a specific video
+      description: |
+        Returns video metadata including title, duration, channel, description.
+        Useful for enriching history entries that only carry a videoId.
+      x-endpoint: video.details
+      tags: [video]
+      parameters:
+        - name: key
+          in: query
+          required: false
+          schema:
+            type: string
+            default: AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VideoDetailsRequest'
+            example:
+              context:
+                client:
+                  clientName: WEB
+                  clientVersion: "2.20241030.06.00"
+              videoId: dQw4w9WgXcQ
+      responses:
+        '200':
+          description: Video details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VideoDetailsResponse'
